@@ -105,6 +105,21 @@ struct usb_hid_descriptor {
   } rdesc[0];
 } PACKED;
 
+#define GUSB_EP_CAP_ISO (1 << 0)
+#define GUSB_EP_CAP_BLK (1 << 1)
+#define GUSB_EP_CAP_INT (1 << 2)
+
+#define GUSB_EP_CAP_ALL (GUSB_EP_CAP_ISO | GUSB_EP_CAP_BLK | GUSB_EP_CAP_INT)
+
+#define GUSB_EP_DIR_OUT(PROP) (PROP << 0)
+#define GUSB_EP_DIR_IN(PROP) (PROP << 3)
+
+#define GUSB_EP_BIDIR(PROP) ((1 << 7) | GUSB_EP_DIR_IN(PROP) | GUSB_EP_DIR_OUT(PROP))
+
+typedef struct {
+  unsigned char ep[USB_ENDPOINT_NUMBER_MASK];
+} s_ep_props;
+
 typedef enum {
   E_TRANSFER_TIMED_OUT = -1,
   E_TRANSFER_STALL = -2,

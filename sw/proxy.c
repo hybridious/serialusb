@@ -4,6 +4,7 @@
  */
 
 #include <gusb.h>
+#include <gadget.h>
 #include <gserial.h>
 #include <protocol.h>
 #include <adapter.h>
@@ -61,26 +62,20 @@ static uint8_t nbInEpFifo = 0;
 
 static volatile int done;
 
-#define EP_PROP_IN    (1 << 0)
-#define EP_PROP_OUT   (1 << 1)
-#define EP_PROP_BIDIR (1 << 2)
-
-#define EP_PROP_INT   (1 << 3)
-#define EP_PROP_BLK   (1 << 4)
-#define EP_PROP_ISO   (1 << 5)
-
 /*
  * the atmega32u4 supports up to 6 non-control endpoints
  * that can be IN or OUT (not BIDIR),
  * and only the INTERRUPT type is supported.
  */
-static uint8_t targetProperties[ENDPOINT_MAX_NUMBER] = {
-  EP_PROP_IN | EP_PROP_OUT | EP_PROP_INT,
-  EP_PROP_IN | EP_PROP_OUT | EP_PROP_INT,
-  EP_PROP_IN | EP_PROP_OUT | EP_PROP_INT,
-  EP_PROP_IN | EP_PROP_OUT | EP_PROP_INT,
-  EP_PROP_IN | EP_PROP_OUT | EP_PROP_INT,
-  EP_PROP_IN | EP_PROP_OUT | EP_PROP_INT,
+static s_ep_props avr8Capabilities = {
+  {
+    GUSB_EP_DIR_IN(GUSB_EP_CAP_INT) | GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT),
+    GUSB_EP_DIR_IN(GUSB_EP_CAP_INT) | GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT),
+    GUSB_EP_DIR_IN(GUSB_EP_CAP_INT) | GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT),
+    GUSB_EP_DIR_IN(GUSB_EP_CAP_INT) | GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT),
+    GUSB_EP_DIR_IN(GUSB_EP_CAP_INT) | GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT),
+    GUSB_EP_DIR_IN(GUSB_EP_CAP_INT) | GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT),
+  }
 };
 
 static int send_next_in_packet() {
@@ -278,36 +273,61 @@ static char * usb_select() {
   return path;
 }
 
-void print_endpoint_properties(uint8_t epProps[ENDPOINT_MAX_NUMBER]) {
+void print_endpoint_properties(s_ep_props * props) {
 
   unsigned char i;
   for (i = 0; i < ENDPOINT_MAX_NUMBER; ++i) {
-    if (epProps[i] != 0) {
-      printf("%hhu", i + 1);
-      if (epProps[i] & EP_PROP_IN) {
+    if (props->ep[i] != 0) {
+      printf("%2hhu", i + 1);
+      if (props->ep[i] & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) {
         printf(" IN");
+      } else {
+        printf("   ");
       }
-      if (epProps[i] & EP_PROP_OUT) {
+      if (props->ep[i] & GUSB_EP_DIR_IN(GUSB_EP_CAP_INT)) {
+        printf(" INT");
+      } else {
+        printf("    ");
+      }
+      if (props->ep[i] & GUSB_EP_DIR_IN(GUSB_EP_CAP_BLK)) {
+        printf(" BLK");
+      } else {
+        printf("    ");
+      }
+      if (props->ep[i] & GUSB_EP_DIR_IN(GUSB_EP_CAP_ISO)) {
+        printf(" ISO");
+      } else {
+        printf("    ");
+      }
+      if (props->ep[i] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) {
         printf(" OUT");
+      } else {
+        printf("    ");
       }
-      if (epProps[i] & EP_PROP_BIDIR) {
+      if (props->ep[i] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT)) {
+        printf(" INT");
+      } else {
+        printf("    ");
+      }
+      if (props->ep[i] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_BLK)) {
+        printf(" BLK");
+      } else {
+        printf("    ");
+      }
+      if (props->ep[i] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ISO)) {
+        printf(" ISO");
+      } else {
+        printf("    ");
+      }
+      if (props->ep[i] & GUSB_EP_BIDIR(0)) {
         printf(" BIDIR");
-      }
-      if (epProps[i] & EP_PROP_INT) {
-        printf(" INTERRUPT");
-      }
-      if (epProps[i] & EP_PROP_BLK) {
-        printf(" BULK");
-      }
-      if (epProps[i] & EP_PROP_ISO) {
-        printf(" ISOCHRONOUS");
       }
       printf("\n");
     }
   }
 }
 
-void get_endpoint_properties(unsigned char configurationIndex, uint8_t epProps[ENDPOINT_MAX_NUMBER]) {
+void get_endpoint_properties(unsigned char configurationIndex, s_ep_props * props) {
 
   struct p_configuration * pConfiguration = descriptors->configurations + configurationIndex;
   unsigned char interfaceIndex;
@@ -321,36 +341,37 @@ void get_endpoint_properties(unsigned char configurationIndex, uint8_t epProps[E
         struct usb_endpoint_descriptor * endpoint =
             descriptors->configurations[configurationIndex].interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
         uint8_t epIndex = ENDPOINT_ADDR_TO_INDEX(endpoint->bEndpointAddress);
+        uint8_t prop = 0;
         switch (endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) {
         case USB_ENDPOINT_XFER_INT:
-          epProps[epIndex] |= EP_PROP_INT;
+          prop = GUSB_EP_CAP_INT;
           break;
         case USB_ENDPOINT_XFER_BULK:
-          epProps[epIndex] |= EP_PROP_BLK;
+          prop = GUSB_EP_CAP_BLK;
           break;
         case USB_ENDPOINT_XFER_ISOC:
-          epProps[epIndex] |= EP_PROP_ISO;
+          prop = GUSB_EP_CAP_ISO;
           break;
         }
         if ((endpoint->bEndpointAddress & USB_ENDPOINT_DIR_MASK) == USB_DIR_IN) {
-          epProps[epIndex] |= EP_PROP_IN;
+          props->ep[epIndex] |= GUSB_EP_DIR_IN(prop);
         } else {
-          epProps[epIndex] |= EP_PROP_OUT;
+          props->ep[epIndex] |= GUSB_EP_DIR_OUT(prop);
         }
-        if ((epProps[epIndex] & (EP_PROP_IN | EP_PROP_OUT)) == (EP_PROP_IN | EP_PROP_OUT)) {
-          epProps[epIndex] |= EP_PROP_BIDIR;
+        if ((props->ep[epIndex] & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) && (props->ep[epIndex] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL))) {
+          props->ep[epIndex] |= GUSB_EP_BIDIR(0);
         }
       }
     }
   }
 }
 
-int compare_endpoint_properties(uint8_t epPropsSource[ENDPOINT_MAX_NUMBER], uint8_t epPropsTarget[ENDPOINT_MAX_NUMBER]) {
+int compare_endpoint_properties(s_ep_props * src, s_ep_props * dst) {
 
   unsigned char i;
   for (i = 0; i < ENDPOINT_MAX_NUMBER; ++i) {
-    if (epPropsSource[i] != 0) {
-      if ((epPropsTarget[i] & epPropsSource[i]) != epPropsSource[i]) {
+    if (src->ep[i] != 0) {
+      if ((dst->ep[i] & src->ep[i]) != src->ep[i]) {
         return 1;
       }
     }
@@ -365,11 +386,11 @@ void fix_endpoints() {
 
   unsigned char configurationIndex;
   for (configurationIndex = 0; configurationIndex < descriptors->device.bNumConfigurations; ++configurationIndex) {
-    uint8_t sourceProperties[ENDPOINT_MAX_NUMBER] = {};
-    get_endpoint_properties(configurationIndex, sourceProperties);
+    s_ep_props sourceProperties = { {} };
+    get_endpoint_properties(configurationIndex, &sourceProperties);
     /*print_endpoint_properties(usedEndpoints);
     print_endpoint_properties(endpointProperties);*/
-    int renumber = compare_endpoint_properties(sourceProperties, targetProperties);
+    int renumber = compare_endpoint_properties(&sourceProperties, &avr8Capabilities);
     unsigned char endpointNumber = 0;
     struct p_configuration * pConfiguration = descriptors->configurations + configurationIndex;
     printf("configuration: %hhu\n", pConfiguration->descriptor->bConfigurationValue);
@@ -619,6 +640,10 @@ static int process_packet(int user, s_packet * packet)
 }
 
 int proxy_init(char * port) {
+
+  printf("Target capabilities:\n");
+
+  print_endpoint_properties(&avr8Capabilities);
 
   char * path = usb_select();
 
