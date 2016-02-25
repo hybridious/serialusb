@@ -202,31 +202,24 @@ int gadget_configure(int device, s_usb_descriptors * descriptors) {
   unsigned int descNumber;
   for(descNumber = 0; descNumber < descriptors->device.bNumConfigurations; ++descNumber) {
 
+    // Gadget configuration fails if remote wakeup is set.
+    descriptors->configurations[descNumber].descriptor->bmAttributes &= ~USB_CONFIG_ATT_WAKEUP;
+
     size = descriptors->configurations[descNumber].descriptor->wTotalLength;
     memcpy(ptr, descriptors->configurations[descNumber].raw, size);
     ptr += size;
   }
 
-  /*for(descNumber = 0; descNumber < descriptors->nbOthers; ++descNumber) {
-
-    size = descriptors->others[descNumber].wLength;
-    memcpy(ptr, descriptors->others[descNumber].data, size);
-    ptr += size;
-  }
-
-  size = descriptors->langId0.bLength;
-  memcpy(ptr, &descriptors->langId0, size);
-  ptr += size;*/
-
   size = descriptors->device.bLength;
   memcpy(ptr, &descriptors->device, size);
   ptr += size;
 
-  write(devices[device].fd, buf, ptr - buf);
+  ret = write(devices[device].fd, buf, ptr - buf);
+  if (ret < 0) {
+    GADGET_PRINT_ERROR("write")
+  }
 
   // TODO MLA: high speed config
-
-
 
   return ret;
 }
