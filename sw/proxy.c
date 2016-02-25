@@ -659,6 +659,7 @@ int proxy_init(char * port) {
     return -1;
   }
 
+  // TODO MLA: get high speed device descriptor
   descriptors = gusb_get_usb_descriptors(usb);
   if (descriptors == NULL) {
     free(path);
@@ -690,6 +691,10 @@ int proxy_init(char * port) {
   }
 
   fix_endpoints();
+
+  /*int gadget = gadget_open("/dev/gadget/dummy_udc");
+
+  gadget_configure(gadget, descriptors);*/
 
   return 0;
 }

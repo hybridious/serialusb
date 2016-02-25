@@ -8,8 +8,11 @@
 
 #include <gusb.h>
 
+int gadget_open(const char * path);
+int gadget_close(int device);
+
+int gadget_configure(int device, s_usb_descriptors * descriptors);
 int gadget_get_properties(const char * path, s_ep_props * props);
 
-int gadget_open(const char * path);
 
 #endif /* GADGET_H_ */
