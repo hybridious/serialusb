@@ -7,7 +7,7 @@
 #define PROXY_H_
 
 int proxy_init();
-int proxy_start(char * port);
+int proxy_start(const char * port, const char * hcd);
 void proxy_stop();
 
 #endif /* PROXY_H_ */

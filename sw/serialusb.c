@@ -11,11 +11,12 @@
 #include <info.h>
 #include <getopt.h>
 
-static char * port = NULL;
+static const char * port = NULL;
+static const char * hcd = NULL;
 
 static void usage()
 {
-  printf("Usage: sudo serialusb --port /dev/ttyUSB0\n");
+  printf("Usage: sudo serialusb <--port /dev/ttyUSB0> <--gadget /dev/gadget/dummy_hcd>\n");
 }
 
 int args_read(int argc, char *argv[]) {
@@ -25,9 +26,10 @@ int args_read(int argc, char *argv[]) {
 
   struct option long_options[] = {
     /* These options don't set a flag. We distinguish them by their indices. */
+    { "gadget",  optional_argument, 0, 'g' },
     { "help",    no_argument,       0, 'h' },
     { "version", no_argument,       0, 'v' },
-    { "port",    required_argument, 0, 'p' },
+    { "port",    optional_argument, 0, 'p' },
     { 0, 0, 0, 0 }
   };
 
@@ -35,13 +37,18 @@ int args_read(int argc, char *argv[]) {
     /* getopt_long stores the option index here. */
     int option_index = 0;
 
-    c = getopt_long(argc, argv, "hp:v", long_options, &option_index);
+    c = getopt_long(argc, argv, "g:hp:v", long_options, &option_index);
 
     /* Detect the end of the options. */
     if (c == -1)
       break;
 
     switch (c) {
+
+    case 'g':
+      hcd = optarg;
+      break;
+
 
     case 'h':
       usage();
@@ -90,8 +97,8 @@ int main(int argc, char * argv[]) {
 
   ret = proxy_init();
 
-  if (ret == 0 && port != NULL) {
-    ret = proxy_start(port);
+  if (ret == 0 && (port != NULL || hcd != NULL)) {
+    ret = proxy_start(port, hcd);
   }
 
   return ret;
