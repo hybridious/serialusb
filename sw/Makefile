@@ -6,7 +6,8 @@ bindir=$(prefix)/bin
 BINS=serialusb
 SCRIPTS=serialusb-capture.sh
 
-OBJECTS := $(patsubst %.c,%.o,$(shell find . -name "*.c"))
+OBJECTS := $(patsubst %.c,%.o,$(shell find . -name "*.c" -not -path "./test/*"))
+OBJECTS:=$(filter-out test/*,$(OBJECTS))
 
 all: $(BINS)
 
@@ -14,6 +15,10 @@ serialusb: $(OBJECTS)
 
 clean:
 	$(RM) $(OBJECTS) $(BINS)
+
+test: test/test_allocator
+
+test/test_allocator: allocator.o test/test_allocator.o
 
 install: all
 	mkdir -p $(prefix)

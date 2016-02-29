@@ -8,6 +8,7 @@
 #include <gserial.h>
 #include <protocol.h>
 #include <adapter.h>
+#include <allocator.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #include <names.h>
 #include <prio.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #define ENDPOINT_MAX_NUMBER USB_ENDPOINT_NUMBER_MASK
 
@@ -46,17 +48,7 @@ static uint8_t endpointsSent = 0;
 
 static uint8_t inPending = 0;
 
-static uint8_t targetToSourceEndpoint[2][ENDPOINT_MAX_NUMBER] = {};
-static uint8_t sourceToTargetEndpoint[2][ENDPOINT_MAX_NUMBER] = {};
-
-#define ENDPOINT_ADDR_TO_INDEX(ENDPOINT) (((ENDPOINT) & USB_ENDPOINT_NUMBER_MASK) - 1)
-#define ENDPOINT_DIR_TO_INDEX(ENDPOINT) ((ENDPOINT) >> 7)
-#define T2S_ENDPOINT(ENDPOINT) targetToSourceEndpoint[ENDPOINT_DIR_TO_INDEX(ENDPOINT)][ENDPOINT_ADDR_TO_INDEX(ENDPOINT)]
-#define S2T_ENDPOINT(ENDPOINT) sourceToTargetEndpoint[ENDPOINT_DIR_TO_INDEX(ENDPOINT)][ENDPOINT_ADDR_TO_INDEX(ENDPOINT)]
-
-#define BIND_ENDPOINT(DIR,SOURCE,TARGET) \
-    T2S_ENDPOINT(DIR | TARGET) = (DIR | SOURCE); \
-    S2T_ENDPOINT(DIR | SOURCE) = (DIR | TARGET);
+static s_endpoint_map endpointMap = { {}, {} };
 
 static struct {
   uint16_t length;
@@ -91,7 +83,7 @@ static int send_next_in_packet() {
   }
 
   if (nbInEpFifo > 0) {
-    uint8_t inPacketIndex = ENDPOINT_ADDR_TO_INDEX(inEpFifo[0]);
+    uint8_t inPacketIndex = ALLOCATOR_ENDPOINT_ADDR_TO_INDEX(inEpFifo[0]);
     int ret = adapter_send(adapter, E_TYPE_IN, (const void *)&inPackets[inPacketIndex].packet, inPackets[inPacketIndex].length);
     if(ret < 0) {
       return -1;
@@ -111,8 +103,8 @@ static int queue_in_packet(unsigned char endpoint, const void * buf, int transfe
     return -1;
   }
 
-  uint8_t inPacketIndex = ENDPOINT_ADDR_TO_INDEX(endpoint);
-  inPackets[inPacketIndex].packet.endpoint = S2T_ENDPOINT(endpoint);
+  uint8_t inPacketIndex = ALLOCATOR_ENDPOINT_ADDR_TO_INDEX(endpoint);
+  inPackets[inPacketIndex].packet.endpoint = ALLOCATOR_S2T_ENDPOINT(&endpointMap, endpoint);
   memcpy(inPackets[inPacketIndex].packet.data, buf, transfered);
   inPackets[inPacketIndex].length = transfered + 1;
   inEpFifo[nbInEpFifo] = endpoint;
@@ -279,33 +271,6 @@ static char * usb_select() {
   return path;
 }
 
-#define PRINT_PROPERTY(DIR,CAP,STR) \
-    if (props->ep[i] & GUSB_EP_DIR_##DIR(GUSB_EP_CAP_##CAP)) { \
-        printf(" "STR); \
-    } else { \
-        printf("    "); \
-    }
-
-static void print_endpoint_properties(const s_ep_props * props) {
-
-  unsigned char i;
-  for (i = 0; i < ENDPOINT_MAX_NUMBER; ++i) {
-    if (props->ep[i] != 0) {
-      printf("%2hhu", i + 1);
-      PRINT_PROPERTY(IN,ALL,"IN ")
-      PRINT_PROPERTY(IN,INT,"INT")
-      PRINT_PROPERTY(IN,BLK,"BLK")
-      PRINT_PROPERTY(IN,ISO,"ISO")
-      PRINT_PROPERTY(OUT,ALL,"OUT")
-      PRINT_PROPERTY(OUT,INT,"INT")
-      PRINT_PROPERTY(OUT,BLK,"BLK")
-      PRINT_PROPERTY(OUT,ISO,"ISO")
-      PRINT_PROPERTY(BIDIR,NONE,"BIDIR")
-      printf("\n");
-    }
-  }
-}
-
 static void get_endpoint_properties(unsigned char configurationIndex, s_ep_props * props) {
 
   struct p_configuration * pConfiguration = descriptors->configurations + configurationIndex;
@@ -319,7 +284,7 @@ static void get_endpoint_properties(unsigned char configurationIndex, s_ep_props
       for (endpointIndex = 0; endpointIndex < pAltInterface->bNumEndpoints; ++endpointIndex) {
         struct usb_endpoint_descriptor * endpoint =
             descriptors->configurations[configurationIndex].interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
-        uint8_t epIndex = ENDPOINT_ADDR_TO_INDEX(endpoint->bEndpointAddress);
+        uint8_t epIndex = ALLOCATOR_ENDPOINT_ADDR_TO_INDEX(endpoint->bEndpointAddress);
         uint8_t prop = 0;
         switch (endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) {
         case USB_ENDPOINT_XFER_INT:
@@ -345,74 +310,6 @@ static void get_endpoint_properties(unsigned char configurationIndex, s_ep_props
   }
 }
 
-static int compare_endpoint_properties(const s_ep_props * src, const s_ep_props * dst) {
-
-  unsigned char i;
-  for (i = 0; i < ENDPOINT_MAX_NUMBER; ++i) {
-    if (src->ep[i] != 0) {
-      if ((dst->ep[i] & src->ep[i]) != src->ep[i]) {
-        return 1;
-      }
-    }
-  }
-
-  return 0;
-}
-
-static unsigned char allocate_endpoint(const unsigned char src, s_ep_props * dst) {
-
-  unsigned char i;
-  for (i = 0; i < ENDPOINT_MAX_NUMBER; ++i) {
-      if ((dst->ep[i] & src) == src) {
-          if (src & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) {
-              if (dst->ep[i] & GUSB_EP_IN_USED) {
-                  continue;
-              }
-              if ((dst->ep[i] & GUSB_EP_OUT_USED) && (dst->ep[i] & GUSB_EP_DIR_BIDIR(GUSB_EP_CAP_NONE)) == 0) {
-                  continue;
-              }
-              dst->ep[i] |= GUSB_EP_IN_USED;
-          }
-          if (src & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) {
-              if (dst->ep[i] & GUSB_EP_OUT_USED) {
-                  continue;
-              }
-              if ((dst->ep[i] & GUSB_EP_IN_USED) && (dst->ep[i] & GUSB_EP_DIR_BIDIR(GUSB_EP_CAP_NONE)) == 0) {
-                  continue;
-              }
-              dst->ep[i] |= GUSB_EP_OUT_USED;
-          }
-          return i + 1;
-      }
-  }
-
-  return 0;
-}
-
-/*static unsigned char allocate_stub_endpoint(unsigned char src, s_ep_props * dst) {
-
-  unsigned char i;
-  for (i = 0; i < ENDPOINT_MAX_NUMBER; ++i) {
-      if ((dst->ep[i] & GUSB_EP_DIR_BIDIR(GUSB_EP_CAP_ALL)) == 0) {
-          if (src & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) {
-              if (dst->ep[i] & GUSB_EP_IN_USED) {
-                  continue;
-              }
-              dst->ep[i] |= GUSB_EP_IN_USED;
-          }
-          if (src & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) {
-              if (dst->ep[i] & GUSB_EP_OUT_USED) {
-                  continue;
-              }
-              dst->ep[i] |= GUSB_EP_OUT_USED;
-          }
-          return i + 1;
-      }
-  }
-
-  return 0;
-}*/
-
 static void fix_device() {
 
   if (descriptors->configurations[0].descriptor->bmAttributes & USB_CONFIG_ATT_WAKEUP) {
@@ -425,52 +322,6 @@ static void fix_device() {
     printf("Multiple configurations are not supported. Only the first one will be kept.\n");
     descriptors->device.bNumConfigurations = 1;
   }
-}
-
-static int allocate_endpoints(unsigned char configurationIndex, s_ep_props * target) {
-
-  s_ep_props source = { { } };
-  get_endpoint_properties(configurationIndex, &source);
-  printf("Source requirements:\n");
-  print_endpoint_properties(&source);
-
-  int renumber = compare_endpoint_properties(&source, target);
-
-  unsigned int endpointIndex;
-  for(endpointIndex = 0; endpointIndex < sizeof(source.ep) / sizeof(*source.ep); ++endpointIndex) {
-    unsigned char sourceNumber = endpointIndex + 1;
-    unsigned char targetNumber = sourceNumber;
-    if (source.ep[endpointIndex] & GUSB_EP_DIR_BIDIR(GUSB_EP_CAP_NONE)) {
-      if (renumber) {
-        // try to allocate a bidirectional endpoint first
-        targetNumber = allocate_endpoint(source.ep[endpointIndex], target);
-      }
-      if (targetNumber != 0) {
-        BIND_ENDPOINT(USB_DIR_IN, sourceNumber, targetNumber)
-        BIND_ENDPOINT(USB_DIR_IN, sourceNumber, targetNumber)
-        continue;
-      }
-      // try to allocate two endpoints
-    }
-    if (source.ep[endpointIndex] & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) {
-      if (renumber) {
-        targetNumber = allocate_endpoint(source.ep[endpointIndex] & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL), target);
-      }
-      if (targetNumber != 0) {
-        BIND_ENDPOINT(USB_DIR_IN, sourceNumber, targetNumber)
-      }
-    }
-    if (source.ep[endpointIndex] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) {
-      if (renumber) {
-        targetNumber = allocate_endpoint(source.ep[endpointIndex] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL), target);
-      }
-      if (targetNumber != 0) {
-        BIND_ENDPOINT(USB_DIR_OUT, sourceNumber, targetNumber)
-      }
-    }
-  }
-
-  return 0;
 }
 
 static int fix_configuration(unsigned char configurationIndex, const s_ep_props * targetCapabilities) {
@@ -496,7 +347,7 @@ static int fix_configuration(unsigned char configurationIndex, const s_ep_props 
         struct usb_endpoint_descriptor * endpoint =
             descriptors->configurations[configurationIndex].interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
         uint8_t sourceEndpoint = endpoint->bEndpointAddress;
-        unsigned char targetEndpoint = S2T_ENDPOINT(sourceEndpoint);
+        unsigned char targetEndpoint = ALLOCATOR_S2T_ENDPOINT(&endpointMap, sourceEndpoint);
         endpoint->bEndpointAddress = targetEndpoint;
         printf("    endpoint:");
         printf(" %s", ((sourceEndpoint & USB_ENDPOINT_DIR_MASK) == USB_DIR_IN) ? "IN" : "OUT");
@@ -611,8 +462,8 @@ static int poll_all_endpoints() {
 
   int ret = 0;
   unsigned char i;
-  for (i = 0; i < sizeof(*targetToSourceEndpoint) / sizeof(**targetToSourceEndpoint) && ret >= 0; ++i) {
-    uint8_t endpoint = T2S_ENDPOINT(USB_DIR_IN | i);
+  for (i = 0; i < sizeof(*endpointMap.targetToSource) / sizeof(**endpointMap.targetToSource) && ret >= 0; ++i) {
+    uint8_t endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, USB_DIR_IN | i);
     if (endpoint) {
       ret = gusb_poll(usb, endpoint);
     }
@@ -624,7 +475,7 @@ static int send_out_packet(s_packet * packet) {
 
   s_endpointPacket * epPacket = (s_endpointPacket *)packet->value;
 
-  return gusb_write(usb, T2S_ENDPOINT(epPacket->endpoint), epPacket->data, packet->header.length - 1);
+  return gusb_write(usb, ALLOCATOR_T2S_ENDPOINT(&endpointMap, epPacket->endpoint), epPacket->data, packet->header.length - 1);
 }
 
 static int send_control_packet(s_packet * packet) {
@@ -632,7 +483,7 @@ static int send_control_packet(s_packet * packet) {
   struct usb_ctrlrequest * setup = (struct usb_ctrlrequest *)packet->value;
   if ((setup->bRequestType & USB_RECIP_MASK) == USB_RECIP_ENDPOINT) {
     if (setup->wIndex != 0) {
-      setup->wIndex = T2S_ENDPOINT(setup->wIndex);
+      setup->wIndex = ALLOCATOR_T2S_ENDPOINT(&endpointMap, setup->wIndex);
     }
   }
 
@@ -784,9 +635,15 @@ int proxy_start(const char * port, const char * hcd) {
 
       printf("Target capabilities:\n");
 
-      print_endpoint_properties(&avr8Target);
+      allocator_print_props(&avr8Target);
 
-      allocate_endpoints(0, &avr8Target);
+      s_ep_props source = { { } };
+      get_endpoint_properties(0, &source);
+
+      printf("Source requirements:\n");
+      allocator_print_props(&source);
+
+      allocator_bind(&source, &avr8Target, &endpointMap);
 
       if (fix_configuration(0, &avr8Target) < 0) {
         return -1;
@@ -814,6 +671,8 @@ int proxy_start(const char * port, const char * hcd) {
           return -1;
       }
 
+      fix_device();
+
       const s_ep_props * gadgetCapabilities = gadget_get_properties(gadget);
 
       if (gadgetCapabilities == NULL) {
@@ -825,18 +684,22 @@ int proxy_start(const char * port, const char * hcd) {
 
       printf("Target capabilities:\n");
 
-      print_endpoint_properties(&target);
-
-      fix_device();
+      allocator_print_props(&target);
 
       //TODO MLA: fix configuration (maybe we need to set bMaxPower...)
 
-      allocate_endpoints(0, &target);
+      s_ep_props source = { { } };
+      get_endpoint_properties(0, &source);
+
+      printf("Source requirements:\n");
+      allocator_print_props(&source);
+
+      allocator_bind(&source, &target, &endpointMap);
 
       if (fix_configuration(0, &target) < 0) {
         gadget_close(gadget);
         return -1;
-    }
+      }
 
       ret = gadget_configure(gadget, descriptors);
       if (ret < 0) {
@@ -863,8 +726,8 @@ int proxy_start(const char * port, const char * hcd) {
 
   if (adapter >= 0) {
       adapter_send(adapter, E_TYPE_RESET, NULL, 0);
-
-      //TODO MLA: adapter_close
+      usleep(10000); // leave time for the reset packet to be sent
+      adapter_close(adapter);
   }
 
   if (gadget >= 0) {

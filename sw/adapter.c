@@ -145,3 +145,15 @@ int adapter_open(const char * port, ADAPTER_READ_CALLBACK fp_read, ADAPTER_WRITE
 
   return -1;
 }
+
+int adapter_close(int adapter) {
+
+  ADAPTER_CHECK(adapter, -1)
+
+  gserial_close(adapters[adapter].serial);
+
+  memset(adapters + adapter, 0x00, sizeof(*adapters));
+  adapters[adapter].serial = -1;
+
+  return 0;
+}
