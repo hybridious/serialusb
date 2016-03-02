@@ -48,7 +48,7 @@ static uint8_t endpointsSent = 0;
 
 static uint8_t inPending = 0;
 
-static s_endpoint_map endpointMap = { {}, {} };
+static s_endpoint_map endpointMap = { {}, {}, {} };
 
 static struct {
   uint16_t length;
@@ -324,7 +324,7 @@ static void fix_device() {
   }
 }
 
-static int fix_configuration(unsigned char configurationIndex, const s_ep_props * targetCapabilities) {
+static int fix_configuration(unsigned char configurationIndex) {
 
   pEndpoints = endpoints;
 
@@ -342,6 +342,7 @@ static int fix_configuration(unsigned char configurationIndex, const s_ep_props 
     for (altInterfaceIndex = 0; altInterfaceIndex < pInterface->bNumAltInterfaces; ++altInterfaceIndex) {
       struct p_altInterface * pAltInterface = pInterface->altInterfaces + altInterfaceIndex;
       printf("  interface: %hhu:%hhu\n", pAltInterface->descriptor->bInterfaceNumber, pAltInterface->descriptor->bAlternateSetting);
+      unsigned char bNumEndpoints = pAltInterface->bNumEndpoints;
       unsigned char endpointIndex;
       for (endpointIndex = 0; endpointIndex < pAltInterface->bNumEndpoints; ++endpointIndex) {
         struct usb_endpoint_descriptor * endpoint =
@@ -357,11 +358,18 @@ static int fix_configuration(unsigned char configurationIndex, const s_ep_props 
             (endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_ISOC ? "ISOCHRONOUS" : "UNKNOWN");
         printf(" %hu", sourceEndpoint & USB_ENDPOINT_NUMBER_MASK);
         if (sourceEndpoint != targetEndpoint) {
-          printf(KRED" -> %hu"KNRM, targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
-          if (targetEndpoint == 0) {
-            printf(KRED" (disabled)"KNRM"\n");
-            endpoint->bDescriptorType = 0x00;
+          if (targetEndpoint == 0x00) {
+            targetEndpoint = ALLOCATOR_S2T_STUB_ENDPOINT(&endpointMap, sourceEndpoint);
+            if (targetEndpoint == 0x00) {
+              printf(KRED" -> no stub available"KNRM"\n");
+              endpoint->bDescriptorType = 0x00;
+              --bNumEndpoints;
+            } else {
+              printf(KRED" -> %hu (stub)"KNRM, targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
+            }
             continue;
+          } else {
+              printf(KRED" -> %hu"KNRM, targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
           }
         } else {
           printf(" -> %hu", targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
@@ -371,6 +379,10 @@ static int fix_configuration(unsigned char configurationIndex, const s_ep_props 
         pEndpoints->type = endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
         pEndpoints->size = endpoint->wMaxPacketSize;
         ++pEndpoints;
+      }
+      if (bNumEndpoints != pAltInterface->bNumEndpoints) {
+          printf(KRED"    bNumEndpoints: %hhu -> %hhu"KNRM"\n", pAltInterface->bNumEndpoints, bNumEndpoints);
+          pAltInterface->bNumEndpoints = bNumEndpoints;
       }
     }
   }
@@ -463,7 +475,7 @@ static int poll_all_endpoints() {
   int ret = 0;
   unsigned char i;
   for (i = 0; i < sizeof(*endpointMap.targetToSource) / sizeof(**endpointMap.targetToSource) && ret >= 0; ++i) {
-    uint8_t endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, USB_DIR_IN | i);
+    uint8_t endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, USB_DIR_IN | (i + 1));
     if (endpoint) {
       ret = gusb_poll(usb, endpoint);
     }
@@ -645,7 +657,7 @@ int proxy_start(const char * port, const char * hcd) {
 
       allocator_bind(&source, &avr8Target, &endpointMap);
 
-      if (fix_configuration(0, &avr8Target) < 0) {
+      if (fix_configuration(0) < 0) {
         return -1;
       }
 
@@ -696,7 +708,7 @@ int proxy_start(const char * port, const char * hcd) {
 
       allocator_bind(&source, &target, &endpointMap);
 
-      if (fix_configuration(0, &target) < 0) {
+      if (fix_configuration(0) < 0) {
         gadget_close(gadget);
         return -1;
       }

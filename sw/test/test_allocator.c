@@ -88,8 +88,9 @@ static struct {
                 .source = &x360Source,
                 .target = &avr8Target,
                 .endpointMap = {
-                        .sourceToTarget = { { 0x00, 0x02, 0x00, 0x04, 0x06, 0x00 }, { 0x81, 0x00, 0x83, 0x00, 0x85 } },
-                        .targetToSource = { { 0x00, 0x02, 0x00, 0x04, 0x00, 0x05 }, { 0x81, 0x00, 0x83, 0x00, 0x85 } },
+                        .sourceToTarget =     { { 0x00, 0x02, 0x00, 0x04, 0x06, 0x00 }, { 0x81, 0x00, 0x83, 0x00, 0x85, 0x00 } },
+                        .targetToSource =     { { 0x00, 0x02, 0x00, 0x04, 0x00, 0x05 }, { 0x81, 0x00, 0x83, 0x00, 0x85, 0x00 } },
+                        .sourceToTargetStub = { { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x82 } },
                 },
                 .renumber = 1
         },
@@ -98,8 +99,9 @@ static struct {
                 .source = &xOneSource,
                 .target = &avr8Target,
                 .endpointMap = {
-                        .sourceToTarget = { { 0x00, 0x02 }, { 0x81 } },
-                        .targetToSource = { { 0x00, 0x02 }, { 0x81 } },
+                        .sourceToTarget =     { { 0x00, 0x02, 0x00, 0x00, 0x00, 0x00 }, { 0x81, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+                        .targetToSource =     { { 0x00, 0x02, 0x00, 0x00, 0x00, 0x00 }, { 0x81, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+                        .sourceToTargetStub = { { 0x00, 0x00, 0x00, 0x01, 0x03, 0x00 }, { 0x00, 0x00, 0x82, 0x00, 0x83, 0x84 } },
                 },
                 .renumber = 1
         },
@@ -172,7 +174,7 @@ int main(int argc, char * argv[]) {
   unsigned int caseNumber;
   for (caseNumber = 0; caseNumber < sizeof(testCases) / sizeof(*testCases); ++caseNumber) {
       s_ep_props target = *testCases[caseNumber].target;
-      s_endpoint_map endpointMap = { {}, {} };
+      s_endpoint_map endpointMap = { {}, {}, {} };
       int renumber = allocator_bind(testCases[caseNumber].source, &target, &endpointMap);
       if (renumber != testCases[caseNumber].renumber) {
           fprintf(stderr, "test \"%s\" failed: bad return value (expected %d, got %d)\n", testCases[caseNumber].name, testCases[caseNumber].renumber, renumber);
