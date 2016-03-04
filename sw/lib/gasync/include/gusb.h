@@ -125,6 +125,14 @@ typedef struct {
 } s_ep_props;
 
 typedef enum {
+  GUSB_SPEED_UNKNOWN,
+  GUSB_SPEED_LOW,
+  GUSB_SPEED_FULL,
+  GUSB_SPEED_HIGH,
+  GUSB_SPEED_SUPER,
+} e_speed;;
+
+typedef enum {
   E_TRANSFER_TIMED_OUT = -1,
   E_TRANSFER_STALL = -2,
   E_TRANSFER_ERROR = -3,
@@ -165,6 +173,11 @@ typedef struct {
     struct usb_string_descriptor langId0;
     unsigned int nbOthers;
     struct p_other * others; //nbOthers elements
+    e_speed speed;
+    struct {
+      struct usb_qualifier_descriptor qualifier;
+      struct p_configuration * configurations; //device.bNumConfigurations elements
+    } other_speed;
 } s_usb_descriptors;
 
 typedef struct {

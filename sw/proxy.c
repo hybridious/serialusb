@@ -140,11 +140,19 @@ int usb_read_callback(int user, unsigned char endpoint, const void * buf, int st
       return -1;
     }
 
-    int ret;
+    int ret = 0;
     if (status >= 0) {
-      ret = adapter_send(adapter, E_TYPE_CONTROL, buf, status);
+      if (adapter >= 0) {
+        ret = adapter_send(adapter, E_TYPE_CONTROL, buf, status);
+      } else if (usb >= 0) {
+        ret = gadget_write(gadget, 0, buf, status);
+      }
     } else {
-      ret = adapter_send(adapter, E_TYPE_CONTROL_STALL, NULL, 0);
+      if (adapter >= 0) {
+        ret = adapter_send(adapter, E_TYPE_CONTROL_STALL, NULL, 0);
+      } else if (usb >= 0) {
+        ret = gadget_stall_control(gadget, USB_DIR_IN);
+      }
     }
     if(ret < 0) {
       return -1;
@@ -184,10 +192,18 @@ int usb_write_callback(int user, unsigned char endpoint, int status) {
     break;
   case E_TRANSFER_STALL:
     if (endpoint == 0) {
-      int ret = adapter_send(adapter, E_TYPE_CONTROL_STALL, NULL, 0);
-      if (ret < 0) {
-        done = 1;
-        return -1;
+      if (adapter >= 0) {
+        int ret = adapter_send(adapter, E_TYPE_CONTROL_STALL, NULL, 0);
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
+      } else if (usb >= 0) {
+        int ret = gadget_stall_control(usb, USB_DIR_OUT);
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
       }
     }
     break;
@@ -196,10 +212,18 @@ int usb_write_callback(int user, unsigned char endpoint, int status) {
     return -1;
   default:
     if (endpoint == 0) {
-      int ret = adapter_send(adapter, E_TYPE_CONTROL, NULL, 0);
-      if (ret < 0) {
-        done = 1;
-        return -1;
+      if (adapter >= 0) {
+        int ret = adapter_send(adapter, E_TYPE_CONTROL, NULL, 0);
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
+      } else if (usb >= 0) {
+          int ret = gadget_ack_control(usb, USB_DIR_OUT);
+          if (ret < 0) {
+            done = 1;
+            return -1;
+          }
       }
     }
     break;
@@ -283,7 +307,7 @@ static void get_endpoint_properties(unsigned char configurationIndex, s_ep_props
       unsigned char endpointIndex;
       for (endpointIndex = 0; endpointIndex < pAltInterface->bNumEndpoints; ++endpointIndex) {
         struct usb_endpoint_descriptor * endpoint =
-            descriptors->configurations[configurationIndex].interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
+                pConfiguration->interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
         uint8_t epIndex = ALLOCATOR_ENDPOINT_ADDR_TO_INDEX(endpoint->bEndpointAddress);
         uint8_t prop = 0;
         switch (endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) {
@@ -496,6 +520,10 @@ static int send_control_packet(s_packet * packet) {
   if ((setup->bRequestType & USB_RECIP_MASK) == USB_RECIP_ENDPOINT) {
     if (setup->wIndex != 0) {
       setup->wIndex = ALLOCATOR_T2S_ENDPOINT(&endpointMap, setup->wIndex);
+      if (setup->wIndex == 0) {
+        PRINT_ERROR_OTHER("control request directed to a stubbed endpoint")
+        return 0;
+      }
     }
   }
 
@@ -592,7 +620,6 @@ int proxy_init(char * port) {
     return -1;
   }
 
-  // TODO MLA: get high speed device descriptor
   descriptors = gusb_get_usb_descriptors(usb);
   if (descriptors == NULL) {
     free(path);
@@ -631,6 +658,83 @@ static int timer_read(int user) {
    * Returning a non-zero value will make gpoll return,
    * this allows to check the 'done' variable.
    */
+  return 1;
+}
+
+static void get_descriptor(struct usb_ctrlrequest * setup, void ** data, uint16_t * length) {
+
+  if ((setup->wValue >> 8) ==  USB_DT_STRING && (setup->wValue & 0xff) == 0x00 && setup->wIndex == 0x0000) {
+    *data = &descriptors->langId0;
+    *length = descriptors->langId0.bLength;
+    return;
+  } else {
+    unsigned int descNumber;
+    for(descNumber = 0; descNumber < descriptors->nbOthers; ++descNumber) {
+      if (descriptors->others[descNumber].wValue == setup->wValue && setup->wIndex == descriptors->others[descNumber].wIndex) {
+        *data = descriptors->others[descNumber].data;
+        *length = descriptors->others[descNumber].wLength;
+        return;
+      }
+    }
+  }
+}
+
+static int gadget_read_callback(int user, unsigned char endpoint, const void * buf, int status) {
+
+  if (endpoint == 0) {
+
+    struct usb_ctrlrequest * setup = (struct usb_ctrlrequest *) buf;
+
+    void * data = NULL;
+    uint16_t length = 0;
+
+    fprintf(stderr, "SETUP %02x.%02x v%04x i%04x %d\n",
+        setup->bRequestType, setup->bRequest, setup->wValue, setup->wIndex, setup->wLength);
+
+    if (setup->bRequestType == USB_DIR_IN && setup->bRequest == USB_REQ_GET_DESCRIPTOR) {
+      get_descriptor(setup, &data, &length);
+    }
+
+    if (data != NULL) {
+      return gadget_write(gadget, 0, data, length);
+    }
+  } else {
+    endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, endpoint);
+    if (endpoint == 0) {
+      PRINT_ERROR_OTHER("can't translate endpoint")
+      return -1;
+    }
+  }
+
+  return gusb_write(usb, endpoint, buf, status);
+}
+
+static int gadget_write_callback(int user, unsigned char endpoint, int status) {
+
+  if (endpoint == 0) {
+    PRINT_ERROR_OTHER("endpoint is 0")
+    return -1;
+  }
+
+  switch (status) {
+  case E_TRANSFER_TIMED_OUT:
+    PRINT_TRANSFER_READ_ERROR(endpoint, "TIMEOUT")
+    break;
+  case E_TRANSFER_STALL:
+    break;
+  case E_TRANSFER_ERROR:
+    PRINT_TRANSFER_WRITE_ERROR(endpoint, "OTHER ERROR")
+    return -1;
+  default:
+    break;
+  }
+
+  return gusb_poll(usb, endpoint);
+}
+
+static int gadget_close_callback(int user) {
+
+  done = 1;
   return 1;
 }
 
@@ -685,14 +789,14 @@ int proxy_start(const char * port, const char * hcd) {
 
       fix_device();
 
-      const s_ep_props * gadgetCapabilities = gadget_get_properties(gadget);
+      const s_ep_props * gadgetTarget = gadget_get_properties(gadget);
 
-      if (gadgetCapabilities == NULL) {
+      if (gadgetTarget == NULL) {
           gadget_close(gadget);
           return -1;
       }
 
-      s_ep_props target = *gadgetCapabilities;
+      s_ep_props target = *gadgetTarget;
 
       printf("Target capabilities:\n");
 
@@ -713,7 +817,17 @@ int proxy_start(const char * port, const char * hcd) {
         return -1;
       }
 
-      ret = gadget_configure(gadget, descriptors);
+      uint16_t inEndpoints = 0;
+      uint16_t outEndpoints = 0;
+      // TODO MLA
+
+      ret = gadget_configure(gadget, descriptors, inEndpoints, outEndpoints);
+      if (ret < 0) {
+          gadget_close(gadget);
+          return -1;
+      }
+
+      ret = gadget_register(gadget, 0, gadget_read_callback, gadget_write_callback, gadget_close_callback, gpoll_register_fd);
       if (ret < 0) {
           gadget_close(gadget);
           return -1;

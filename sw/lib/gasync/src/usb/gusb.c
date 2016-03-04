@@ -437,12 +437,19 @@ int gusb_read_timeout(int device, unsigned char endpoint, void * buf, unsigned i
   return transfer_timeout(device, endpointIndex, LIBUSB_ENDPOINT_IN, buf, count, timeout);
 }
 
-static int get_configurations (int device) {
+static int get_configurations (int device, int other_speed) {
 
   s_usb_descriptors * descriptors = &usbdevices[device].descriptors;
 
-  descriptors->configurations = calloc(descriptors->device.bNumConfigurations, sizeof(*descriptors->configurations));
-  if (descriptors->configurations == NULL) {
+  struct p_configuration ** configurations = &descriptors->configurations;
+  unsigned char descriptorType = LIBUSB_DT_CONFIG;
+  if (other_speed) {
+    configurations = &descriptors->other_speed.configurations;
+    descriptorType = USB_DT_OTHER_SPEED_CONFIG;
+  }
+
+  *configurations = calloc(descriptors->device.bNumConfigurations, sizeof(**configurations));
+  if (*configurations == NULL) {
     PRINT_ERROR_ALLOC_FAILED("calloc");
     return -1;
   }
@@ -453,7 +460,7 @@ static int get_configurations (int device) {
     struct usb_config_descriptor descriptor;
     
     int ret = libusb_control_transfer(usbdevices[device].devh, LIBUSB_ENDPOINT_IN,
-        LIBUSB_REQUEST_GET_DESCRIPTOR, (LIBUSB_DT_CONFIG << 8) | index, 0, (unsigned char *)&descriptor,
+        LIBUSB_REQUEST_GET_DESCRIPTOR, (descriptorType << 8) | index, 0, (unsigned char *)&descriptor,
         sizeof(descriptor), USBASYNC_DEFAULT_TIMEOUT);
     
     if (ret < 0) {
@@ -461,16 +468,16 @@ static int get_configurations (int device) {
       return -1;
     }
     
-    struct p_configuration * configurations = descriptors->configurations + index;
+    struct p_configuration * configuration = (*configurations) + index;
 
-    configurations->raw = calloc(descriptor.wTotalLength, sizeof(unsigned char));
-    if (configurations->raw == NULL) {
+    configuration->raw = calloc(descriptor.wTotalLength, sizeof(unsigned char));
+    if (configuration->raw == NULL) {
       PRINT_ERROR_ALLOC_FAILED("calloc");
       return -1;
     }
     
     ret = libusb_control_transfer(usbdevices[device].devh, LIBUSB_ENDPOINT_IN,
-        LIBUSB_REQUEST_GET_DESCRIPTOR, (LIBUSB_DT_CONFIG << 8) | index, 0, configurations->raw,
+        LIBUSB_REQUEST_GET_DESCRIPTOR, (descriptorType << 8) | index, 0, configuration->raw,
         descriptor.wTotalLength, USBASYNC_DEFAULT_TIMEOUT);
     
     if (ret < 0) {
@@ -781,6 +788,26 @@ static int get_device (int device) {
   return 0;
 }
 
+static int get_device_qualifier (int device) {
+
+  struct usb_qualifier_descriptor * descriptor = &usbdevices[device].descriptors.other_speed.qualifier;
+
+  int ret = libusb_control_transfer(usbdevices[device].devh, LIBUSB_ENDPOINT_IN,
+      LIBUSB_REQUEST_GET_DESCRIPTOR, (USB_DT_DEVICE_QUALIFIER << 8) | 0, 0, (unsigned char *)descriptor,
+      sizeof(*descriptor), USBASYNC_DEFAULT_TIMEOUT);
+
+  if (ret == LIBUSB_ERROR_PIPE) {
+    return 1;
+  }
+
+  if (ret < 0) {
+    PRINT_ERROR_LIBUSB("libusb_control_transfer", ret)
+    return -1;
+  }
+
+  return 0;
+}
+
 static void get_lang_id_0 (int device) {
 
   struct usb_string_descriptor * descriptor = &usbdevices[device].descriptors.langId0;
@@ -808,11 +835,21 @@ static int get_descriptors (int device) {
     return -1;
   }
   
-  ret = get_configurations(device);
+  ret = get_configurations(device, 0);
   if (ret < 0) {
     return -1;
   }
-  
+
+  ret = get_device_qualifier(device);
+  if (ret == 0) {
+    ret = get_configurations(device, 1);
+    if (ret < 0) {
+      return -1;
+    }
+  } else if (ret < 0) {
+    return -1;
+  }
+
   return probe_configurations(device);
 }
 
@@ -897,6 +934,26 @@ static int claim_device(int device, libusb_device * dev, struct libusb_device_de
   if (ret != LIBUSB_SUCCESS) {
     PRINT_ERROR_LIBUSB("libusb_reset_device", ret)
     return -1;
+  }
+
+  ret = libusb_get_device_speed(dev);
+
+  switch(ret) {
+  case LIBUSB_SPEED_UNKNOWN:
+    usbdevices[device].descriptors.speed = GUSB_SPEED_UNKNOWN;
+    break;
+  case LIBUSB_SPEED_LOW:
+    usbdevices[device].descriptors.speed = GUSB_SPEED_LOW;
+    break;
+  case LIBUSB_SPEED_FULL:
+    usbdevices[device].descriptors.speed = GUSB_SPEED_FULL;
+    break;
+  case LIBUSB_SPEED_HIGH:
+    usbdevices[device].descriptors.speed = GUSB_SPEED_HIGH;
+    break;
+  case LIBUSB_SPEED_SUPER:
+    usbdevices[device].descriptors.speed = GUSB_SPEED_SUPER;
+    break;
   }
 
   int configuration;

@@ -13,13 +13,35 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <linux/usb/gadgetfs.h>
+#include <errno.h>
+#include <sys/ioctl.h>
 
 #define GADGET_MAX_DEVICES 8
+
+#define GADGET_MAX_ENDPOINTS USB_ENDPOINT_NUMBER_MASK
+
+#define GADGET_GET_ENDPOINT(DEVICE, ENDPOINT) \
+    devices[DEVICE].endpoints[(ENDPOINT) >> 7][((ENDPOINT) & USB_ENDPOINT_NUMBER_MASK) - 1]
+
+typedef struct {
+  struct usb_endpoint_descriptor descriptor;
+  int fd;
+} s_endpoint;
 
 static struct {
   int fd;
   char * path;
   s_ep_props props;
+  GPOLL_REGISTER_FD fp_register;
+  struct {
+    int user;
+    USBASYNC_READ_CALLBACK fp_read;
+    USBASYNC_WRITE_CALLBACK fp_write;
+    USBASYNC_CLOSE_CALLBACK fp_close;
+  } callback;
+  s_endpoint endpoints[2][GADGET_MAX_ENDPOINTS];
+  struct usb_ctrlrequest last_setup;
 } devices[GADGET_MAX_DEVICES] = { };
 
 #define PRINT_ERROR(msg) print_error(__FILE__, __LINE__, msg);
@@ -246,7 +268,7 @@ int gadget_open(const char * path) {
         return -1;
     }
 
-    s_ep_props props = { {} };
+    s_ep_props props = { { } };
 
     int ret = probe(fd, path, &props);
 
@@ -256,9 +278,8 @@ int gadget_open(const char * path) {
         return -1;
     }
 
-    fd = open(path, O_RDWR);
+    fd = open(path, O_RDWR | O_NONBLOCK);
     if (fd == -1) {
-
         PRINT_ERROR("open")
         return -1;
     }
@@ -281,7 +302,51 @@ int gadget_close(int device) {
   return 0;
 }
 
-int gadget_configure(int device, s_usb_descriptors * descriptors) {
+static int store_endpoints(int device, struct p_configuration * configuration, uint16_t inEndpoints, uint16_t outEndpoints) {
+
+  unsigned char interfaceIndex;
+  for (interfaceIndex = 0; interfaceIndex < configuration->descriptor->bNumInterfaces; ++interfaceIndex) {
+    struct p_interface * pInterface = configuration->interfaces + interfaceIndex;
+    unsigned char altInterfaceIndex;
+    for (altInterfaceIndex = 0; altInterfaceIndex < pInterface->bNumAltInterfaces; ++altInterfaceIndex) {
+      struct p_altInterface * pAltInterface = pInterface->altInterfaces + altInterfaceIndex;
+      unsigned char endpointIndex;
+      for (endpointIndex = 0; endpointIndex < pAltInterface->bNumEndpoints; ++endpointIndex) {
+        struct usb_endpoint_descriptor * endpoint =
+            configuration->interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
+        if (((endpoint->bEndpointAddress & USB_DIR_IN) ? inEndpoints : outEndpoints)
+            & (1 << ((endpoint->bEndpointAddress & USB_ENDPOINT_NUMBER_MASK) - 1)) == 0) {
+          continue;
+        }
+        GADGET_GET_ENDPOINT(device, endpoint->bEndpointAddress).descriptor = *endpoint;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static const char * get_endpoint_path(int device, unsigned short endpointProps) {
+
+
+  return NULL;
+}
+
+static int configure_endpoints(int device) {
+
+  unsigned char endpointIndex;
+  for (endpointIndex = 0; endpointIndex < GADGET_MAX_ENDPOINTS; ++endpointIndex) {
+    s_endpoint * in = GADGET_GET_ENDPOINT(device, USB_DIR_IN | (endpointIndex + 1));
+    s_endpoint * out = GADGET_GET_ENDPOINT(device, USB_DIR_OUT | (endpointIndex + 1));
+    unsigned short endpointProps = devices[device].props.ep[endpointIndex];
+    const char * path = get_endpoint_path(device, endpointProps);
+
+  }
+
+  return 0;
+}
+
+int gadget_configure(int device, s_usb_descriptors * descriptors, uint16_t inEndpoints, uint16_t outEndpoints) {
 
   GADGET_CHECK_DEVICE(device, -1)
 
@@ -300,25 +365,252 @@ int gadget_configure(int device, s_usb_descriptors * descriptors) {
     return -1;
   }
 
-  unsigned char buf[4096] = { 0, 0, 0, 0 };
-  unsigned char * ptr = buf + 4;
+  struct p_configuration * full_speed = NULL;
+  struct p_configuration * high_speed = NULL;
 
-  size_t size;
+  switch (descriptors->speed) {
+  case GUSB_SPEED_FULL:
+    full_speed = descriptors->configurations;
+    high_speed = descriptors->other_speed.configurations;
+    if (high_speed == NULL) {
+      high_speed = full_speed;
+    }
+    break;
+  case GUSB_SPEED_HIGH:
+    high_speed = descriptors->configurations;
+    full_speed = descriptors->other_speed.configurations;
+    if (full_speed == NULL) {
+      full_speed = high_speed;
+    }
+    break;
+  default:
+    PRINT_ERROR_OTHER("unsupported USB speed")
+    return -1;
+  }
 
-  size = descriptors->configurations[0].descriptor->wTotalLength;
-  memcpy(ptr, descriptors->configurations[0].raw, size);
+  size_t size = 4 + full_speed[0].descriptor->wTotalLength + high_speed[0].descriptor->wTotalLength
+      + descriptors->device.bLength;
+  union {
+    uint32_t tag;
+    unsigned char buf[size];
+  } config;
+
+  config.tag = 0;
+  unsigned char * ptr = config.buf + sizeof(config.tag);
+
+  size = full_speed[0].descriptor->wTotalLength;
+  memcpy(ptr, full_speed[0].raw, size);
+  ptr += size;
+
+  size = high_speed[0].descriptor->wTotalLength;
+  memcpy(ptr, high_speed[0].raw, size);
   ptr += size;
 
   size = descriptors->device.bLength;
   memcpy(ptr, &descriptors->device, size);
   ptr += size;
 
-  int ret = write(devices[device].fd, buf, ptr - buf);
+  int ret = write(devices[device].fd, config.buf, ptr - config.buf);
   if (ret < 0) {
     PRINT_ERROR("write")
+    return -1;
   }
 
-  // TODO MLA: high speed config
+  ret = store_endpoints(device, descriptors->configurations, inEndpoints, outEndpoints);
+  if (ret < 0) {
+    return -1;
+  }
 
-  return ret;
+  return 0;
+}
+
+static int close_callback(int device) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  return devices[device].callback.fp_close(devices[device].callback.user);
+}
+
+static int control_callback(int device) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  struct usb_gadgetfs_event event;
+
+  int ret = read(devices[device].fd, &event, sizeof(event));
+  if (ret != sizeof(event)) {
+    if (ret == -1) {
+      PRINT_ERROR("read")
+    } else {
+      PRINT_ERROR_OTHER("failed to read a gadget event")
+    }
+    return devices[device].callback.fp_close(devices[device].callback.user);
+  }
+
+  switch (event.type) {
+  case GADGETFS_NOP:
+    break;
+  case GADGETFS_CONNECT:
+    PRINT_ERROR_OTHER("CONNECT")
+    break;
+  case GADGETFS_SETUP:
+  {
+    unsigned char buf[sizeof(event.u.setup) + event.u.setup.wLength];
+    memcpy(buf, &event.u.setup, sizeof(event.u.setup));
+    unsigned int count = sizeof(event.u.setup);
+    if ((event.u.setup.bRequestType & USB_ENDPOINT_DIR_MASK) == USB_DIR_OUT) {
+      if (event.u.setup.wLength > 0) {
+        ret = read(devices[device].fd, buf + sizeof(event.u.setup), event.u.setup.wLength);
+        if (ret == -1) {
+          PRINT_ERROR("read")
+          return -1;
+        }
+        count += ret;
+      }
+    }
+
+    devices[device].last_setup = event.u.setup;
+
+    // When a control transfer is pending the fd is signaled as readable and read() fails with EAGAIN.
+    // Therefore remove the fd until the control transfer completes.
+
+    gpoll_remove_fd(devices[device].fd); //TODO MLA
+
+    ret = devices[device].callback.fp_read(devices[device].callback.user, 0, buf, count);
+    if (ret == -1) {
+      ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+      if (ret < 0) {
+        return -1;
+      }
+      ret = gadget_stall_control(device, event.u.setup.bRequestType & USB_DIR_IN);
+      if (ret < 0) {
+        return -1;
+      }
+    }
+    break;
+  }
+  case GADGETFS_DISCONNECT:
+    PRINT_ERROR_OTHER("DISCONNECT")
+    break;
+  case GADGETFS_SUSPEND:
+    PRINT_ERROR_OTHER("SUSPEND")
+    break;
+  default:
+    PRINT_ERROR_OTHER("bad event type")
+    return -1;
+  }
+
+  return 0;
+}
+
+int gadget_write(int device, unsigned char endpoint, const void * buf, unsigned int count) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  if (endpoint == 0) {
+    int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+    if (ret < 0) {
+      return -1;
+    }
+  }
+
+  int ret = write(devices[device].fd, buf, count);
+  if (ret < 0) {
+    PRINT_ERROR("write")
+    return -1;
+  }
+  return 0;
+}
+
+int gadget_stall_control(int device, unsigned char direction) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+  if (ret < 0) {
+    return -1;
+  }
+
+  PRINT_ERROR_OTHER("gadget_stall_control")
+
+  int status;
+  if (direction == USB_DIR_IN) {
+    ret = read (devices[device].fd, &status, 0);
+    if (ret != -1) {
+      PRINT_ERROR_OTHER("can't stall endpoint 0")
+      return -1;
+    }
+    if (errno != EL2HLT) {
+      PRINT_ERROR("read")
+      return -1;
+    }
+  } else {
+    ret = write (devices[device].fd, &status, 0);
+    if (ret != -1) {
+      PRINT_ERROR_OTHER("can't stall endpoint 0")
+      return -1;
+    }
+    if (errno != EL2HLT) {
+      PRINT_ERROR("write")
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int gadget_ack_control(int device, unsigned char direction) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+  if (ret < 0) {
+    return -1;
+  }
+
+  if ((devices[device].last_setup.bRequestType & USB_ENDPOINT_DIR_MASK) == USB_DIR_OUT
+          && devices[device].last_setup.bRequest == USB_REQ_SET_CONFIGURATION) {
+    ret = configure_endpoints(device);
+    if (ret < 0) {
+      return -1;
+    }
+  }
+
+  PRINT_ERROR_OTHER("ack")
+
+  int status;
+  if (direction == USB_DIR_OUT) {
+    ret = read (devices[device].fd, &status, 0);
+    if (ret == -1) {
+      PRINT_ERROR("read")
+      return -1;
+    }
+  } else {
+    ret = write (devices[device].fd, &status, 0);
+    if (ret == -1) {
+      PRINT_ERROR("write")
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int gadget_register(int device, int user, USBASYNC_READ_CALLBACK fp_read, USBASYNC_WRITE_CALLBACK fp_write,
+      USBASYNC_CLOSE_CALLBACK fp_close, GPOLL_REGISTER_FD fp_register) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  int ret = fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+  if (ret < 0) {
+    return -1;
+  }
+
+  devices[device].fp_register = fp_register;
+  devices[device].callback.user = user;
+  devices[device].callback.fp_read = fp_read;
+  devices[device].callback.fp_write = fp_write;
+  devices[device].callback.fp_close = fp_close;
+
+  return 0;
 }
