@@ -756,7 +756,43 @@ static int control_callback(int device) {
 
 int gadget_poll(int device, unsigned char endpoint) {
 
-  //TODO MLA
+  GADGET_CHECK_DEVICE(device, -1)
+
+  if ((endpoint & USB_ENDPOINT_NUMBER_MASK) == 0 || (endpoint & USB_DIR_IN)) {
+    PRINT_ERROR_INVALID_ENDPOINT("invalid endpoint", endpoint)
+    return -1;
+  }
+
+  s_endpoint * pEndpoint = &GADGET_ADDRESS_TO_ENDPOINT(device, endpoint);
+  struct iocb * iocb = malloc(sizeof(struct iocb));
+  if (iocb == NULL) {
+    PRINT_ERROR_ALLOC_FAILED("malloc")
+    return -1;
+  }
+  unsigned int count = pEndpoint->descriptor.wMaxPacketSize;
+  void * ptr = malloc(count);
+  if (ptr == NULL) {
+    free(iocb);
+    PRINT_ERROR_ALLOC_FAILED("malloc")
+    return -1;
+  }
+  io_prep_pread(iocb, pEndpoint->fd, ptr, count, 0);
+  iocb->key = USB_DIR_OUT;
+  iocb->data = (void *)(intptr_t)((device << 8) | endpoint);
+  io_set_eventfd(iocb, devices[device].aio_eventfd);
+  int ret = add_transfer(iocb);
+  if (ret < 0) {
+    free(ptr);
+    free(iocb);
+    return -1;
+  }
+  ret = io_submit(devices[device].aio_ctx, 1, &iocb);
+  if (ret < 0) {
+    PRINT_ERROR("io_submit")
+    remove_transfer(iocb);
+    return -1;
+  }
+
   return 0;
 }
 
@@ -872,8 +908,6 @@ int gadget_stall_control(int device, unsigned char direction) {
     return -1;
   }
 
-  PRINT_ERROR_OTHER("gadget_stall_control")
-
   int status;
   if (direction == USB_DIR_IN) {
     ret = read (devices[device].fd, &status, 0);
@@ -916,8 +950,6 @@ int gadget_ack_control(int device, unsigned char direction) {
       return -1;
     }
   }
-
-  PRINT_ERROR_OTHER("ack")
 
   int status;
   if (direction == USB_DIR_OUT) {
