@@ -16,13 +16,18 @@
 #include <linux/usb/gadgetfs.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <libaio.h>
+#include <sys/eventfd.h>
 
 #define GADGET_MAX_DEVICES 8
 
 #define GADGET_MAX_ENDPOINTS USB_ENDPOINT_NUMBER_MASK
 
-#define GADGET_GET_ENDPOINT(DEVICE, ENDPOINT) \
-    devices[DEVICE].endpoints[(ENDPOINT) >> 7][((ENDPOINT) & USB_ENDPOINT_NUMBER_MASK) - 1]
+#define GADGET_ADDRESS_TO_ENDPOINT(DEVICE, ADDRESS) \
+    devices[DEVICE].endpoints[(ADDRESS) >> 7][((ADDRESS) & USB_ENDPOINT_NUMBER_MASK) - 1]
+
+#define GADGET_INDEX_TO_ENDPOINT(DEVICE, DIRECTION, INDEX) \
+    devices[DEVICE].endpoints[DIRECTION >> 7][INDEX]
 
 typedef struct {
   struct usb_endpoint_descriptor descriptor;
@@ -32,6 +37,7 @@ typedef struct {
 static struct {
   int fd;
   char * path;
+  char * dir;
   s_ep_props props;
   GPOLL_REGISTER_FD fp_register;
   struct {
@@ -42,6 +48,9 @@ static struct {
   } callback;
   s_endpoint endpoints[2][GADGET_MAX_ENDPOINTS];
   struct usb_ctrlrequest last_setup;
+  enum usb_device_speed speed;
+  io_context_t aio_ctx;
+  int aio_eventfd;
 } devices[GADGET_MAX_DEVICES] = { };
 
 #define PRINT_ERROR(msg) print_error(__FILE__, __LINE__, msg);
@@ -53,6 +62,8 @@ void print_error(const char * file, int line, const char * msg) {
   fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, msg);
 
 #define PRINT_ERROR_ALLOC_FAILED(func) fprintf(stderr, "%s:%d %s: %s failed\n", __FILE__, __LINE__, __func__, func);
+
+#define PRINT_ERROR_INVALID_ENDPOINT(msg, endpoint) fprintf(stderr, "%s:%d %s: %s: 0x%02x\n", __FILE__, __LINE__, __func__, msg, endpoint);
 
 static inline int gadget_check_device(int device, const char * file, unsigned int line, const char * func) {
   if (device < 0 || device >= GADGET_MAX_DEVICES) {
@@ -70,11 +81,58 @@ static inline int gadget_check_device(int device, const char * file, unsigned in
     return retValue; \
   }
 
+static struct iocb ** iocbs = NULL;
+static unsigned int iocbs_nb = 0;
+
+static int add_transfer(struct iocb * transfer) {
+  unsigned int i;
+  for (i = 0; i < iocbs_nb; ++i) {
+    if (iocbs[i] == transfer) {
+      return 0;
+    }
+  }
+  void * ptr = realloc(iocbs, (iocbs_nb + 1) * sizeof(*iocbs));
+  if (ptr) {
+    iocbs = ptr;
+    iocbs[iocbs_nb] = transfer;
+    iocbs_nb++;
+    return 0;
+  } else {
+    PRINT_ERROR_ALLOC_FAILED("realloc")
+    return -1;
+  }
+}
+
+static void remove_transfer(struct iocb * transfer) {
+  unsigned int i;
+  for (i = 0; i < iocbs_nb; ++i) {
+    if (iocbs[i] == transfer) {
+      memmove(iocbs + i, iocbs + i + 1, (iocbs_nb - i - 1) * sizeof(*iocbs));
+      iocbs_nb--;
+      void * ptr = realloc(iocbs, iocbs_nb * sizeof(*iocbs));
+      if (ptr || !iocbs_nb) {
+        iocbs = ptr;
+      } else {
+        PRINT_ERROR_ALLOC_FAILED("realloc")
+      }
+      free(transfer->u.c.buf);
+      free(transfer);
+      break;
+    }
+  }
+}
+
 void gadget_init(void) __attribute__((constructor (101)));
 void gadget_init(void) {
   int i;
   for (i = 0; i < GADGET_MAX_DEVICES; ++i) {
     devices[i].fd = -1;
+    devices[i].aio_eventfd = -1;
+    unsigned char endpointIndex;
+    for (endpointIndex = 0; endpointIndex < GADGET_MAX_ENDPOINTS; ++endpointIndex) {
+        GADGET_INDEX_TO_ENDPOINT(i, USB_DIR_IN, endpointIndex).fd = -1;
+        GADGET_INDEX_TO_ENDPOINT(i, USB_DIR_OUT, endpointIndex).fd = -1;
+    }
   }
 }
 
@@ -88,7 +146,7 @@ void gadget_clean(void) {
   }
 }
 
-static int add_device(const char * path, int fd, const s_ep_props * props) {
+static int add_device(const char * path, int fd, char * dir, const s_ep_props * props) {
   int i;
   for (i = 0; i < GADGET_MAX_DEVICES; ++i) {
     if (devices[i].path && !strcmp(devices[i].path, path)) {
@@ -98,15 +156,32 @@ static int add_device(const char * path, int fd, const s_ep_props * props) {
   }
   for (i = 0; i < GADGET_MAX_DEVICES; ++i) {
     if (devices[i].fd == -1) {
+      io_context_t aio_ctx;
+      memset(&aio_ctx, 0, sizeof(aio_ctx));
+      int ret = io_setup(GADGET_MAX_DEVICES * GADGET_MAX_ENDPOINTS * 2, &aio_ctx);
+      if (ret == -1) {
+        PRINT_ERROR("io_setup")
+        return -1;
+      }
+      int aio_eventfd = eventfd(0, EFD_NONBLOCK);
+      if (aio_eventfd < 0) {
+        io_destroy(aio_ctx);
+        PRINT_ERROR("eventfd")
+        return -1;
+      }
       devices[i].path = strdup(path);
-      if (devices[i].path != NULL) {
-        devices[i].fd = fd;
-        devices[i].props = *props;
-        return i;
-      } else {
+      if (devices[i].path == NULL) {
+        io_destroy(aio_ctx);
+        close(aio_eventfd);
         fprintf(stderr, "%s:%d add_device %s: can't duplicate path\n", __FILE__, __LINE__, path);
         return -1;
       }
+      devices[i].fd = fd;
+      devices[i].dir = dir;
+      devices[i].props = *props;
+      devices[i].aio_ctx = aio_ctx;
+      devices[i].aio_eventfd = aio_eventfd;
+      return i;
     }
   }
   return -1;
@@ -119,25 +194,13 @@ const s_ep_props * gadget_get_properties(int device) {
     return &devices[device].props;
 }
 
-static int prope_endpoints(const char * path, s_ep_props * props) {
+static int prope_endpoints(const char * dir, s_ep_props * props) {
 
     struct dirent * d;
-
-    const char * ptr = strrchr(path, '/');
-    if (ptr == NULL) {
-        return -1;
-    }
-
-    char * dir = strndup(path, ptr - path);
-    if (dir == NULL) {
-        PRINT_ERROR_ALLOC_FAILED("strndup")
-        return -1;
-    }
 
     DIR * dirp = opendir(dir);
     if (dirp == NULL) {
         PRINT_ERROR("opendir")
-        free(dir);
         return -1;
     }
 
@@ -199,13 +262,12 @@ static int prope_endpoints(const char * path, s_ep_props * props) {
         }
     }
 
-    free(dir);
     closedir(dirp);
 
     return 0;
 }
 
-static int probe(int fd, const char * path, s_ep_props * props) {
+static int probe(int fd, const char * dir, s_ep_props * props) {
 
     union {
         unsigned char buf[0];
@@ -252,7 +314,7 @@ static int probe(int fd, const char * path, s_ep_props * props) {
         return -1;
     }
 
-    return prope_endpoints(path, props);
+    return prope_endpoints(dir, props);
 }
 
 int gadget_open(const char * path) {
@@ -270,39 +332,93 @@ int gadget_open(const char * path) {
 
     s_ep_props props = { { } };
 
-    int ret = probe(fd, path, &props);
+    const char * ptr = strrchr(path, '/');
+    if (ptr == NULL) {
+        return -1;
+    }
+
+    char * dir = strndup(path, ptr - path);
+    if (dir == NULL) {
+        PRINT_ERROR_ALLOC_FAILED("strndup")
+        return -1;
+    }
+
+    int ret = probe(fd, dir, &props);
 
     close(fd);
 
     if (ret < 0) {
+        free(dir);
         return -1;
     }
 
     fd = open(path, O_RDWR | O_NONBLOCK);
     if (fd == -1) {
         PRINT_ERROR("open")
+        free(dir);
         return -1;
     }
 
-    return add_device(path, fd, &props);
+    ret = add_device(path, fd, dir, &props);
+    if (ret < 0) {
+        free(dir);
+        return -1;
+    }
+
+    return ret;
 }
 
 int gadget_close(int device) {
 
   GADGET_CHECK_DEVICE(device, -1)
 
+  if (devices[device].aio_eventfd >= 0) {
+    close(devices[device].aio_eventfd);
+  }
+  if (devices[device].aio_ctx != NULL) {
+    io_destroy(devices[device].aio_ctx);
+  }
+
+  unsigned int i;
+  for (i = 0; i < iocbs_nb; ++i) {
+    if ((((intptr_t)iocbs[i]->data) >> 8) == device) {
+      remove_transfer(iocbs[i]);
+    }
+  }
+
   close(devices[device].fd);
 
   free(devices[device].path);
+
+  free(devices[device].dir);
+
+  unsigned char endpointIndex;
+  for (endpointIndex = 0; endpointIndex < GADGET_MAX_ENDPOINTS; ++endpointIndex) {
+    s_endpoint * inEndpoint = &GADGET_INDEX_TO_ENDPOINT(device, USB_DIR_IN, endpointIndex);
+    s_endpoint * outEndpoint = &GADGET_INDEX_TO_ENDPOINT(device, USB_DIR_OUT, endpointIndex);
+    if (inEndpoint->fd >= 0) {
+      close(inEndpoint->fd);
+    }
+    if (outEndpoint->fd >= 0) {
+      close(outEndpoint->fd);
+    }
+  }
 
   memset(devices + device, 0x00, sizeof(*devices));
 
   devices[device].fd = -1;
 
+  devices[device].aio_eventfd = -1;
+
+  for (endpointIndex = 0; endpointIndex < GADGET_MAX_ENDPOINTS; ++endpointIndex) {
+    GADGET_INDEX_TO_ENDPOINT(device, USB_DIR_IN, endpointIndex).fd = -1;
+    GADGET_INDEX_TO_ENDPOINT(device, USB_DIR_OUT, endpointIndex).fd = -1;
+  }
+
   return 0;
 }
 
-static int store_endpoints(int device, struct p_configuration * configuration, uint16_t inEndpoints, uint16_t outEndpoints) {
+static int store_endpoints(int device, struct p_configuration * configuration, unsigned short endpoints[2]) {
 
   unsigned char interfaceIndex;
   for (interfaceIndex = 0; interfaceIndex < configuration->descriptor->bNumInterfaces; ++interfaceIndex) {
@@ -314,11 +430,11 @@ static int store_endpoints(int device, struct p_configuration * configuration, u
       for (endpointIndex = 0; endpointIndex < pAltInterface->bNumEndpoints; ++endpointIndex) {
         struct usb_endpoint_descriptor * endpoint =
             configuration->interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
-        if (((endpoint->bEndpointAddress & USB_DIR_IN) ? inEndpoints : outEndpoints)
-            & (1 << ((endpoint->bEndpointAddress & USB_ENDPOINT_NUMBER_MASK) - 1)) == 0) {
-          continue;
+        unsigned short mask = 1 << ((endpoint->bEndpointAddress & USB_ENDPOINT_NUMBER_MASK) - 1);
+        if (endpoints[endpoint->bEndpointAddress >> 7] & mask) {
+          // use memcpy to avoid copying uninitialized bytes
+          memcpy(&GADGET_ADDRESS_TO_ENDPOINT(device, endpoint->bEndpointAddress).descriptor, endpoint, endpoint->bLength);
         }
-        GADGET_GET_ENDPOINT(device, endpoint->bEndpointAddress).descriptor = *endpoint;
       }
     }
   }
@@ -326,27 +442,161 @@ static int store_endpoints(int device, struct p_configuration * configuration, u
   return 0;
 }
 
-static const char * get_endpoint_path(int device, unsigned short endpointProps) {
+static void get_endpoint_paths(int device, unsigned char endpointIndex, char ** inPath, char ** outPath) {
 
+  char tmpInPath[strlen(devices[device].dir) + sizeof("ep15in-bulk")];
+  char tmpOutPath[strlen(devices[device].dir) + sizeof("ep15in-bulk")];
 
-  return NULL;
+  int count = sprintf(tmpInPath, "%s/ep%hhu", devices[device].dir, endpointIndex + 1);
+  if (count < 0) {
+    PRINT_ERROR_OTHER("sprintf failed")
+    return;
+  }
+  char * ptrIn = tmpInPath + count;
+
+  count = sprintf(tmpOutPath, "%s/ep%hhu", devices[device].dir, endpointIndex + 1);
+  if (count < 0) {
+    PRINT_ERROR_OTHER("sprintf failed")
+    return;
+  }
+  char * ptrOut = tmpOutPath + count;
+
+  unsigned short endpointProps = devices[device].props.ep[endpointIndex];
+
+  if (endpointProps & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) {
+    if ((endpointProps & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) == GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL)) {
+      count = sprintf(ptrIn, "in");
+    } else if (endpointProps & GUSB_EP_DIR_IN(GUSB_EP_CAP_INT)) {
+      count = sprintf(ptrIn, "in-int");
+    } else if (endpointProps & GUSB_EP_DIR_IN(GUSB_EP_CAP_ISO)) {
+      count = sprintf(ptrIn, "in-iso");
+    } else if (endpointProps & GUSB_EP_DIR_IN(GUSB_EP_CAP_BLK)) {
+      count = sprintf(ptrIn, "in-bulk");
+    }
+    if (count < 0) {
+      PRINT_ERROR_OTHER("sprintf failed")
+      return;
+    }
+
+    *inPath = strdup(tmpInPath);
+    if (*inPath == NULL) {
+      PRINT_ERROR_ALLOC_FAILED("strdup")
+      return;
+    }
+  }
+  if (endpointProps & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) {
+    if ((endpointProps & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) == GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) {
+      count = sprintf(ptrOut, "out");
+    } else if (endpointProps & GUSB_EP_DIR_OUT(GUSB_EP_CAP_INT)) {
+      count = sprintf(ptrOut, "out-int");
+    } else if (endpointProps & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ISO)) {
+      count = sprintf(ptrOut, "out-iso");
+    } else if (endpointProps & GUSB_EP_DIR_OUT(GUSB_EP_CAP_BLK)) {
+      count = sprintf(ptrOut, "out-bulk");
+    }
+    if (count < 0) {
+      PRINT_ERROR_OTHER("sprintf failed")
+      return;
+    }
+
+    *outPath = strdup(tmpOutPath);
+    if (*outPath == NULL) {
+      PRINT_ERROR_ALLOC_FAILED("strdup")
+      free(*inPath);
+      *inPath = NULL;
+    }
+  }
+}
+
+static int configure_endpoint(s_endpoint * endpoint, char * path) {
+
+  if (endpoint->fd >= 0) {
+    close(endpoint->fd);
+  }
+
+  fprintf(stderr, "OPEN %s\n", path);
+
+  int flags;
+  if (endpoint->descriptor.bEndpointAddress & USB_DIR_IN) {
+    flags = O_WRONLY | O_NONBLOCK;
+  } else {
+    flags = O_RDONLY | O_NONBLOCK;
+  }
+
+  endpoint->fd = open(path, flags);
+  if (endpoint->fd == -1) {
+    PRINT_ERROR("open")
+    return -1;
+  }
+
+  size_t size = 4 + endpoint->descriptor.bLength + endpoint->descriptor.bLength;
+  union {
+    uint32_t tag;
+    unsigned char buf[size];
+  } config;
+
+  config.tag = 1;
+  unsigned char * ptr = config.buf + sizeof(config.tag);
+
+  size = endpoint->descriptor.bLength;
+  memcpy(ptr, &endpoint->descriptor, size);
+  ptr += size;
+
+  // TODO MLA: high speed config
+
+  size = endpoint->descriptor.bLength;
+  memcpy(ptr, &endpoint->descriptor, size);
+  ptr += size;
+
+  int ret = write(endpoint->fd, config.buf, ptr - config.buf);
+  if (ret < 0) {
+    PRINT_ERROR("write")
+    close(endpoint->fd);
+    endpoint->fd = -1;
+    return -1;
+  }
+
+  return 0;
 }
 
 static int configure_endpoints(int device) {
 
   unsigned char endpointIndex;
   for (endpointIndex = 0; endpointIndex < GADGET_MAX_ENDPOINTS; ++endpointIndex) {
-    s_endpoint * in = GADGET_GET_ENDPOINT(device, USB_DIR_IN | (endpointIndex + 1));
-    s_endpoint * out = GADGET_GET_ENDPOINT(device, USB_DIR_OUT | (endpointIndex + 1));
-    unsigned short endpointProps = devices[device].props.ep[endpointIndex];
-    const char * path = get_endpoint_path(device, endpointProps);
-
+    s_endpoint * inEndpoint = &GADGET_INDEX_TO_ENDPOINT(device, USB_DIR_IN, endpointIndex);
+    s_endpoint * outEndpoint = &GADGET_INDEX_TO_ENDPOINT(device, USB_DIR_OUT, endpointIndex);
+    if (inEndpoint->descriptor.bEndpointAddress == 0x00 && outEndpoint->descriptor.bEndpointAddress == 0x00) {
+        continue;
+    }
+    char * inPath = NULL;
+    char * outPath = NULL;
+    get_endpoint_paths(device, endpointIndex, &inPath, &outPath);
+    int ret = 0;
+    if (inEndpoint->descriptor.bEndpointAddress != 0x00) {
+      if (inPath != NULL) {
+        ret = configure_endpoint(inEndpoint, inPath);
+      } else {
+        ret = -1;
+      }
+    }
+    if (outEndpoint->descriptor.bEndpointAddress != 0x00) {
+      if (outPath != NULL) {
+        ret = configure_endpoint(outEndpoint, outPath);
+      } else {
+        ret = -1;
+      }
+    }
+    free(inPath);
+    free(outPath);
+    if (ret < 0) {
+      return -1;
+    }
   }
 
   return 0;
 }
 
-int gadget_configure(int device, s_usb_descriptors * descriptors, uint16_t inEndpoints, uint16_t outEndpoints) {
+int gadget_configure(int device, s_usb_descriptors * descriptors, unsigned short endpoints[2]) {
 
   GADGET_CHECK_DEVICE(device, -1)
 
@@ -369,14 +619,14 @@ int gadget_configure(int device, s_usb_descriptors * descriptors, uint16_t inEnd
   struct p_configuration * high_speed = NULL;
 
   switch (descriptors->speed) {
-  case GUSB_SPEED_FULL:
+  case USB_SPEED_FULL:
     full_speed = descriptors->configurations;
     high_speed = descriptors->other_speed.configurations;
     if (high_speed == NULL) {
       high_speed = full_speed;
     }
     break;
-  case GUSB_SPEED_HIGH:
+  case USB_SPEED_HIGH:
     high_speed = descriptors->configurations;
     full_speed = descriptors->other_speed.configurations;
     if (full_speed == NULL) {
@@ -416,7 +666,7 @@ int gadget_configure(int device, s_usb_descriptors * descriptors, uint16_t inEnd
     return -1;
   }
 
-  ret = store_endpoints(device, descriptors->configurations, inEndpoints, outEndpoints);
+  ret = store_endpoints(device, descriptors->configurations, endpoints);
   if (ret < 0) {
     return -1;
   }
@@ -452,6 +702,7 @@ static int control_callback(int device) {
     break;
   case GADGETFS_CONNECT:
     PRINT_ERROR_OTHER("CONNECT")
+    devices[device].speed = event.u.speed;
     break;
   case GADGETFS_SETUP:
   {
@@ -503,6 +754,67 @@ static int control_callback(int device) {
   return 0;
 }
 
+int gadget_poll(int device, unsigned char endpoint) {
+
+  //TODO MLA
+  return 0;
+}
+
+static int eventfd_close_callback(int device) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  return devices[device].callback.fp_close(devices[device].callback.user);
+}
+
+static int eventfd_read_callback(int device) {
+
+  GADGET_CHECK_DEVICE(device, -1)
+
+  uint64_t value;
+  int ret = read(devices[device].aio_eventfd, &value, sizeof(value));
+  if (ret < 0) {
+    PRINT_ERROR("read")
+    return -1;
+  }
+
+  struct io_event events[value];
+
+  int nbEvents = io_getevents(devices[device].aio_ctx, value, value, events, NULL);
+  if (nbEvents < 0) {
+    errno = -nbEvents;
+    PRINT_ERROR("io_getevents")
+    return -1;
+  }
+
+  int result = 0;
+
+  int eventIndex;
+  for (eventIndex = 0; eventIndex < nbEvents; ++eventIndex) {
+    struct io_event * event = events + eventIndex;
+    signed long res = (signed long)event->res;
+    unsigned char endpoint = ((intptr_t)event->obj->data) & 0xff;
+    int status = res;
+    if (res < 0) {
+      errno = -res;
+      PRINT_ERROR("io_event")
+      // TODO MLA: TIMEOUT, STALL, CANCEL
+      status = E_TRANSFER_ERROR;
+    }
+    if (endpoint & USB_DIR_IN) {
+      ret = devices[device].callback.fp_write(devices[device].callback.user, endpoint, status);
+    } else {
+      ret = devices[device].callback.fp_read(devices[device].callback.user, endpoint, event->obj->data, status);
+    }
+    remove_transfer(event->obj);
+    if (ret < 0) {
+      result = -1;
+    }
+  }
+
+  return result;
+}
+
 int gadget_write(int device, unsigned char endpoint, const void * buf, unsigned int count) {
 
   GADGET_CHECK_DEVICE(device, -1)
@@ -512,12 +824,41 @@ int gadget_write(int device, unsigned char endpoint, const void * buf, unsigned 
     if (ret < 0) {
       return -1;
     }
-  }
-
-  int ret = write(devices[device].fd, buf, count);
-  if (ret < 0) {
-    PRINT_ERROR("write")
-    return -1;
+    ret = write(devices[device].fd, buf, count);
+    if (ret < 0) {
+      PRINT_ERROR("write")
+      return -1;
+    }
+  } else {
+    s_endpoint * pEndpoint = &GADGET_ADDRESS_TO_ENDPOINT(device, endpoint);
+    struct iocb * iocb = malloc(sizeof(struct iocb));
+    if (iocb == NULL) {
+      PRINT_ERROR_ALLOC_FAILED("malloc")
+      return -1;
+    }
+    void * ptr = malloc(count);
+    if (ptr == NULL) {
+      free(iocb);
+      PRINT_ERROR_ALLOC_FAILED("malloc")
+      return -1;
+    }
+    memcpy(ptr, buf, count);
+    io_prep_pwrite(iocb, pEndpoint->fd, ptr, count, 0);
+    iocb->key = USB_DIR_IN;
+    iocb->data = (void *)(intptr_t)((device << 8) | endpoint);
+    io_set_eventfd(iocb, devices[device].aio_eventfd);
+    int ret = add_transfer(iocb);
+    if (ret < 0) {
+      free(ptr);
+      free(iocb);
+      return -1;
+    }
+    ret = io_submit(devices[device].aio_ctx, 1, &iocb);
+    if (ret < 0) {
+      PRINT_ERROR("io_submit")
+      remove_transfer(iocb);
+      return -1;
+    }
   }
   return 0;
 }
@@ -602,6 +943,11 @@ int gadget_register(int device, int user, USBASYNC_READ_CALLBACK fp_read, USBASY
   GADGET_CHECK_DEVICE(device, -1)
 
   int ret = fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+  if (ret < 0) {
+    return -1;
+  }
+
+  ret = fp_register(devices[device].aio_eventfd, device, eventfd_read_callback, NULL, eventfd_close_callback);
   if (ret < 0) {
     return -1;
   }

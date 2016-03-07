@@ -940,19 +940,19 @@ static int claim_device(int device, libusb_device * dev, struct libusb_device_de
 
   switch(ret) {
   case LIBUSB_SPEED_UNKNOWN:
-    usbdevices[device].descriptors.speed = GUSB_SPEED_UNKNOWN;
+    usbdevices[device].descriptors.speed = USB_SPEED_UNKNOWN;
     break;
   case LIBUSB_SPEED_LOW:
-    usbdevices[device].descriptors.speed = GUSB_SPEED_LOW;
+    usbdevices[device].descriptors.speed = USB_SPEED_LOW;
     break;
   case LIBUSB_SPEED_FULL:
-    usbdevices[device].descriptors.speed = GUSB_SPEED_FULL;
+    usbdevices[device].descriptors.speed = USB_SPEED_FULL;
     break;
   case LIBUSB_SPEED_HIGH:
-    usbdevices[device].descriptors.speed = GUSB_SPEED_HIGH;
+    usbdevices[device].descriptors.speed = USB_SPEED_HIGH;
     break;
   case LIBUSB_SPEED_SUPER:
-    usbdevices[device].descriptors.speed = GUSB_SPEED_SUPER;
+    usbdevices[device].descriptors.speed = USB_SPEED_SUPER;
     break;
   }
 

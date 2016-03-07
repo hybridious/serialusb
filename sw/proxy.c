@@ -58,6 +58,12 @@ static struct {
 static uint8_t inEpFifo[MAX_ENDPOINTS] = {};
 static uint8_t nbInEpFifo = 0;
 
+static enum {
+  E_GADGET_INIT,
+  E_GADGET_CONFIGURING,
+  E_GADGET_CONFIGURED
+} gadget_state = E_GADGET_INIT;;
+
 static volatile int done;
 
 /*
@@ -167,21 +173,47 @@ int usb_read_callback(int user, unsigned char endpoint, const void * buf, int st
 
     if (status >= 0) {
 
-      int ret = queue_in_packet(endpoint, buf, status);
-      if (ret < 0) {
-        done = 1;
-        return -1;
-      }
+      if (adapter >= 0) {
+        int ret = queue_in_packet(endpoint, buf, status);
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
 
-      ret = send_next_in_packet();
-      if (ret < 0) {
-        done = 1;
-        return -1;
+        ret = send_next_in_packet();
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
+      } else if (gadget >= 0) {
+        int ret = gadget_write(gadget, ALLOCATOR_S2T_ENDPOINT(&endpointMap, endpoint), buf, status);
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
+        ret = gusb_poll(usb, endpoint);
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
       }
     }
   }
 
   return 0;
+}
+
+static int poll_all_endpoints() {
+
+  int ret = 0;
+  unsigned char i;
+  for (i = 0; i < sizeof(*endpointMap.targetToSource) / sizeof(**endpointMap.targetToSource) && ret >= 0; ++i) {
+    uint8_t endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, USB_DIR_IN | (i + 1));
+    if (endpoint) {
+      ret = gusb_poll(usb, endpoint);
+    }
+  }
+  return ret;
 }
 
 int usb_write_callback(int user, unsigned char endpoint, int status) {
@@ -219,11 +251,15 @@ int usb_write_callback(int user, unsigned char endpoint, int status) {
           return -1;
         }
       } else if (usb >= 0) {
-          int ret = gadget_ack_control(usb, USB_DIR_OUT);
-          if (ret < 0) {
-            done = 1;
-            return -1;
-          }
+        int ret = gadget_ack_control(usb, USB_DIR_OUT);
+        if (ret < 0) {
+          done = 1;
+          return -1;
+        }
+        if (gadget_state == E_GADGET_CONFIGURING) {
+          poll_all_endpoints();
+          gadget_state = E_GADGET_CONFIGURED;
+        }
       }
     }
     break;
@@ -494,19 +530,6 @@ static int send_endpoints() {
   return adapter_send(adapter, E_TYPE_ENDPOINTS, (unsigned char *)&endpoints, (pEndpoints - endpoints) * sizeof(*endpoints));
 }
 
-static int poll_all_endpoints() {
-
-  int ret = 0;
-  unsigned char i;
-  for (i = 0; i < sizeof(*endpointMap.targetToSource) / sizeof(**endpointMap.targetToSource) && ret >= 0; ++i) {
-    uint8_t endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, USB_DIR_IN | (i + 1));
-    if (endpoint) {
-      ret = gusb_poll(usb, endpoint);
-    }
-  }
-  return ret;
-}
-
 static int send_out_packet(s_packet * packet) {
 
   s_endpointPacket * epPacket = (s_endpointPacket *)packet->value;
@@ -698,6 +721,10 @@ static int gadget_read_callback(int user, unsigned char endpoint, const void * b
     if (data != NULL) {
       return gadget_write(gadget, 0, data, length);
     }
+
+    if (setup->bRequestType == USB_DIR_OUT && setup->bRequest == USB_REQ_SET_CONFIGURATION) {
+      gadget_state = E_GADGET_CONFIGURING;
+    }
   } else {
     endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, endpoint);
     if (endpoint == 0) {
@@ -736,6 +763,19 @@ static int gadget_close_callback(int user) {
 
   done = 1;
   return 1;
+}
+
+void get_used_endpoints(unsigned short endpoints[2]) {
+
+  unsigned char endpointIndex;
+  for (endpointIndex = 0; endpointIndex < ALLOCATOR_MAX_ENDPOINT_NUMBER; ++endpointIndex) {
+    if (ALLOCATOR_T2S_ENDPOINT(&endpointMap, USB_DIR_OUT | (endpointIndex + 1))) {
+      endpoints[USB_DIR_OUT >> 7] |= (1 << endpointIndex);
+    }
+    if (ALLOCATOR_T2S_ENDPOINT(&endpointMap, USB_DIR_IN | (endpointIndex + 1))) {
+      endpoints[USB_DIR_IN >> 7] |= (1 << endpointIndex);
+    }
+  }
 }
 
 int proxy_start(const char * port, const char * hcd) {
@@ -817,11 +857,10 @@ int proxy_start(const char * port, const char * hcd) {
         return -1;
       }
 
-      uint16_t inEndpoints = 0;
-      uint16_t outEndpoints = 0;
-      // TODO MLA
+      unsigned short endpoints[2] = {};
+      get_used_endpoints(endpoints);
 
-      ret = gadget_configure(gadget, descriptors, inEndpoints, outEndpoints);
+      ret = gadget_configure(gadget, descriptors, endpoints);
       if (ret < 0) {
           gadget_close(gadget);
           return -1;
