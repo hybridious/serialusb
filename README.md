@@ -40,6 +40,11 @@ These goals led to the following decisions:
 
 * GNU/Linux
 * libusb >= 1.0.16
+* libudev
+* libaio
+
+On Linux Mint 17.3:
+sudo apt-get install libusb-1.0-0-dev libudev-dev libaio-dev
 
 # Hardware requirements
 
