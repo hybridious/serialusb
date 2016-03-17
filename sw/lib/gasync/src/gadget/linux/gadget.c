@@ -943,8 +943,8 @@ int gadget_ack_control(int device, unsigned char direction) {
     return -1;
   }
 
-  if ((devices[device].last_setup.bRequestType & USB_ENDPOINT_DIR_MASK) == USB_DIR_OUT
-          && devices[device].last_setup.bRequest == USB_REQ_SET_CONFIGURATION) {
+  if (devices[device].last_setup.bRequestType == (USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE)
+        && devices[device].last_setup.bRequest == USB_REQ_SET_CONFIGURATION) {
     ret = configure_endpoints(device);
     if (ret < 0) {
       return -1;

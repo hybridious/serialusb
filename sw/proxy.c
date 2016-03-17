@@ -150,13 +150,13 @@ int usb_read_callback(int user, unsigned char endpoint, const void * buf, int st
     if (status >= 0) {
       if (adapter >= 0) {
         ret = adapter_send(adapter, E_TYPE_CONTROL, buf, status);
-      } else if (usb >= 0) {
+      } else if (gadget >= 0) {
         ret = gadget_write(gadget, 0, buf, status);
       }
     } else {
       if (adapter >= 0) {
         ret = adapter_send(adapter, E_TYPE_CONTROL_STALL, NULL, 0);
-      } else if (usb >= 0) {
+      } else if (gadget >= 0) {
         ret = gadget_stall_control(gadget, USB_DIR_IN);
       }
     }
@@ -230,8 +230,8 @@ int usb_write_callback(int user, unsigned char endpoint, int status) {
           done = 1;
           return -1;
         }
-      } else if (usb >= 0) {
-        int ret = gadget_stall_control(usb, USB_DIR_OUT);
+      } else if (gadget >= 0) {
+        int ret = gadget_stall_control(gadget, USB_DIR_OUT);
         if (ret < 0) {
           done = 1;
           return -1;
@@ -250,8 +250,8 @@ int usb_write_callback(int user, unsigned char endpoint, int status) {
           done = 1;
           return -1;
         }
-      } else if (usb >= 0) {
-        int ret = gadget_ack_control(usb, USB_DIR_OUT);
+      } else if (gadget >= 0) {
+        int ret = gadget_ack_control(gadget, USB_DIR_OUT);
         if (ret < 0) {
           done = 1;
           return -1;
@@ -756,7 +756,7 @@ static int gadget_write_callback(int user, unsigned char endpoint, int status) {
     break;
   }
 
-  return gusb_poll(usb, endpoint);
+  return 0;
 }
 
 static int gadget_close_callback(int user) {
