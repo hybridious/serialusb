@@ -140,15 +140,14 @@ int usb_read_callback(int user, unsigned char endpoint, const void * buf, int st
 
   if (endpoint == 0) {
 
-    if (status > (int)MAX_PACKET_VALUE_SIZE) {
-      PRINT_ERROR_OTHER("too many bytes transfered")
-      done = 1;
-      return -1;
-    }
-
     int ret = 0;
     if (status >= 0) {
       if (adapter >= 0) {
+        if (status > (int)MAX_PACKET_VALUE_SIZE) {
+          PRINT_ERROR_OTHER("too many bytes transfered")
+          done = 1;
+          return -1;
+        }
         ret = adapter_send(adapter, E_TYPE_CONTROL, buf, status);
       } else if (gadget >= 0) {
         ret = gadget_write(gadget, 0, buf, status);
@@ -164,16 +163,13 @@ int usb_read_callback(int user, unsigned char endpoint, const void * buf, int st
       return -1;
     }
   } else {
-
-    if (status > MAX_PAYLOAD_SIZE_EP) {
-      PRINT_ERROR_OTHER("too many bytes transfered")
-      done = 1;
-      return -1;
-    }
-
     if (status >= 0) {
-
       if (adapter >= 0) {
+        if (status > MAX_PAYLOAD_SIZE_EP) {
+          PRINT_ERROR_OTHER("too many bytes transfered")
+          done = 1;
+          return -1;
+        }
         int ret = queue_in_packet(endpoint, buf, status);
         if (ret < 0) {
           done = 1;
@@ -435,10 +431,12 @@ static int fix_configuration(unsigned char configurationIndex) {
           printf(" -> %hu", targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
         }
         printf("\n");
-        pEndpoints->number = endpoint->bEndpointAddress;
-        pEndpoints->type = endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
-        pEndpoints->size = endpoint->wMaxPacketSize;
-        ++pEndpoints;
+        if (adapter >= 0) {
+          pEndpoints->number = endpoint->bEndpointAddress;
+          pEndpoints->type = endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
+          pEndpoints->size = endpoint->wMaxPacketSize;
+          ++pEndpoints;
+        }
       }
       if (bNumEndpoints != pAltInterface->bNumEndpoints) {
           printf(KRED"    bNumEndpoints: %hhu -> %hhu"KNRM"\n", pAltInterface->bNumEndpoints, bNumEndpoints);
@@ -530,16 +528,19 @@ static int send_endpoints() {
   return adapter_send(adapter, E_TYPE_ENDPOINTS, (unsigned char *)&endpoints, (pEndpoints - endpoints) * sizeof(*endpoints));
 }
 
-static int send_out_packet(s_packet * packet) {
+static int usb_send_out_packet(unsigned char endpoint, const void * buf, unsigned int length) {
 
-  s_endpointPacket * epPacket = (s_endpointPacket *)packet->value;
+  endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, endpoint);
+  if (endpoint == 0) {
+    PRINT_ERROR_OTHER("OUT packet directed to a stubbed endpoint")
+    return -1;
+  }
 
-  return gusb_write(usb, ALLOCATOR_T2S_ENDPOINT(&endpointMap, epPacket->endpoint), epPacket->data, packet->header.length - 1);
+  return gusb_write(usb, endpoint, buf, length);
 }
 
-static int send_control_packet(s_packet * packet) {
+static int usb_send_control_packet(struct usb_ctrlrequest * setup, unsigned int length) {
 
-  struct usb_ctrlrequest * setup = (struct usb_ctrlrequest *)packet->value;
   if ((setup->bRequestType & USB_RECIP_MASK) == USB_RECIP_ENDPOINT) {
     if (setup->wIndex != 0) {
       setup->wIndex = ALLOCATOR_T2S_ENDPOINT(&endpointMap, setup->wIndex);
@@ -550,7 +551,7 @@ static int send_control_packet(s_packet * packet) {
     }
   }
 
-  return gusb_write(usb, 0, packet->value, packet->header.length);
+  return gusb_write(usb, 0, setup, length);
 }
 
 static void dump(unsigned char * data, unsigned char length)
@@ -594,10 +595,16 @@ static int process_packet(int user, s_packet * packet)
     }
     break;
   case E_TYPE_OUT:
-    ret = send_out_packet(packet);
+    {
+      s_endpointPacket * epPacket = (s_endpointPacket *)packet->value;
+      ret = usb_send_out_packet(epPacket->endpoint, epPacket->data, packet->header.length - 1);
+    }
     break;
   case E_TYPE_CONTROL:
-    ret = send_control_packet(packet);
+    {
+      struct usb_ctrlrequest * setup = (struct usb_ctrlrequest *)packet->value;
+      ret = usb_send_control_packet(setup, packet->header.length);
+    }
     break;
   case E_TYPE_DEBUG:
     {
@@ -714,26 +721,25 @@ static int gadget_read_callback(int user, unsigned char endpoint, const void * b
     fprintf(stderr, "SETUP %02x.%02x v%04x i%04x %d\n",
         setup->bRequestType, setup->bRequest, setup->wValue, setup->wIndex, setup->wLength);
 
-    if (setup->bRequestType == USB_DIR_IN && setup->bRequest == USB_REQ_GET_DESCRIPTOR) {
+    if (setup->bRequestType == (USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE)
+            && setup->bRequest == USB_REQ_GET_DESCRIPTOR) {
       get_descriptor(setup, &data, &length);
+      if (data != NULL) {
+        return gadget_write(gadget, 0, data, length);
+      }
     }
 
-    if (data != NULL) {
-      return gadget_write(gadget, 0, data, length);
-    }
-
-    if (setup->bRequestType == USB_DIR_OUT && setup->bRequest == USB_REQ_SET_CONFIGURATION) {
+    if (setup->bRequestType == (USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE)
+            && setup->bRequest == USB_REQ_SET_CONFIGURATION) {
       gadget_state = E_GADGET_CONFIGURING;
     }
-  } else {
-    endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, endpoint);
-    if (endpoint == 0) {
-      PRINT_ERROR_OTHER("can't translate endpoint")
-      return -1;
-    }
-  }
 
-  return gusb_write(usb, endpoint, buf, status);
+    return usb_send_control_packet(setup, status);
+    
+  } else {
+
+    return usb_send_out_packet(endpoint, buf, status);
+  }
 }
 
 static int gadget_write_callback(int user, unsigned char endpoint, int status) {
@@ -744,11 +750,7 @@ static int gadget_write_callback(int user, unsigned char endpoint, int status) {
   }
 
   switch (status) {
-  case E_TRANSFER_TIMED_OUT:
-    PRINT_TRANSFER_READ_ERROR(endpoint, "TIMEOUT")
-    break;
-  case E_TRANSFER_STALL:
-    break;
+  //TODO MLA
   case E_TRANSFER_ERROR:
     PRINT_TRANSFER_WRITE_ERROR(endpoint, "OTHER ERROR")
     return -1;

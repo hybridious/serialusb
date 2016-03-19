@@ -48,6 +48,7 @@ static struct {
   } callback;
   s_endpoint endpoints[2][GADGET_MAX_ENDPOINTS];
   struct usb_ctrlrequest last_setup;
+  unsigned int pending;
   enum usb_device_speed speed;
   io_context_t aio_ctx;
   int aio_eventfd;
@@ -256,7 +257,8 @@ static int prope_endpoints(const char * dir, s_ep_props * props) {
                 break;
             }
             props->ep[number] |= prop;
-            if ((props->ep[number] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL)) && (props->ep[number] & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL))) {
+            if ((props->ep[number] & GUSB_EP_DIR_OUT(GUSB_EP_CAP_ALL))
+                && (props->ep[number] & GUSB_EP_DIR_IN(GUSB_EP_CAP_ALL))) {
                 props->ep[number] |= GUSB_EP_DIR_BIDIR(0);
             }
         }
@@ -516,14 +518,7 @@ static int configure_endpoint(s_endpoint * endpoint, char * path) {
 
   fprintf(stderr, "OPEN %s\n", path);
 
-  int flags;
-  if (endpoint->descriptor.bEndpointAddress & USB_DIR_IN) {
-    flags = O_WRONLY | O_NONBLOCK;
-  } else {
-    flags = O_RDONLY | O_NONBLOCK;
-  }
-
-  endpoint->fd = open(path, flags);
+  endpoint->fd = open(path, O_RDWR | O_NONBLOCK);
   if (endpoint->fd == -1) {
     PRINT_ERROR("open")
     return -1;
@@ -721,11 +716,12 @@ static int control_callback(int device) {
     }
 
     devices[device].last_setup = event.u.setup;
+    devices[device].pending++;
 
     // When a control transfer is pending the fd is signaled as readable and read() fails with EAGAIN.
     // Therefore remove the fd until the control transfer completes.
 
-    gpoll_remove_fd(devices[device].fd); //TODO MLA
+    gpoll_remove_fd(devices[device].fd);
 
     ret = devices[device].callback.fp_read(devices[device].callback.user, 0, buf, count);
     if (ret == -1) {
@@ -840,7 +836,7 @@ static int eventfd_read_callback(int device) {
     if (endpoint & USB_DIR_IN) {
       ret = devices[device].callback.fp_write(devices[device].callback.user, endpoint, status);
     } else {
-      ret = devices[device].callback.fp_read(devices[device].callback.user, endpoint, event->obj->data, status);
+      ret = devices[device].callback.fp_read(devices[device].callback.user, endpoint, event->obj->u.c.buf, status);
     }
     remove_transfer(event->obj);
     if (ret < 0) {
@@ -859,6 +855,9 @@ int gadget_write(int device, unsigned char endpoint, const void * buf, unsigned 
     int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
     if (ret < 0) {
       return -1;
+    }
+    if (devices[device].pending > 0) {
+      devices[device].pending--;
     }
     ret = write(devices[device].fd, buf, count);
     if (ret < 0) {
@@ -908,6 +907,15 @@ int gadget_stall_control(int device, unsigned char direction) {
     return -1;
   }
 
+  if (devices[device].pending > 0) {
+    devices[device].pending--;
+  }
+
+  if (devices[device].pending != 0) {
+    // TODO MLA: debug message
+    return 0;
+  }
+
   int status;
   if (direction == USB_DIR_IN) {
     ret = read (devices[device].fd, &status, 0);
@@ -943,12 +951,27 @@ int gadget_ack_control(int device, unsigned char direction) {
     return -1;
   }
 
+  if (devices[device].pending > 0) {
+    devices[device].pending--;
+  }
+
+  if (devices[device].pending != 0) {
+    // TODO MLA: debug message
+    return 0;
+  }
+
   if (devices[device].last_setup.bRequestType == (USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE)
         && devices[device].last_setup.bRequest == USB_REQ_SET_CONFIGURATION) {
     ret = configure_endpoints(device);
     if (ret < 0) {
       return -1;
     }
+  }
+
+  if ((devices[device].last_setup.bRequestType & USB_ENDPOINT_DIR_MASK) == USB_DIR_OUT
+      && devices[device].last_setup.wLength > 0) {
+    // OUT transfers with a data stage are always acked by gadgetfs
+    return 0;
   }
 
   int status;
