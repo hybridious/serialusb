@@ -516,7 +516,9 @@ static int configure_endpoint(s_endpoint * endpoint, char * path) {
     close(endpoint->fd);
   }
 
+#ifdef GADGET_DEBUG
   fprintf(stderr, "OPEN %s\n", path);
+#endif
 
   endpoint->fd = open(path, O_RDWR | O_NONBLOCK);
   if (endpoint->fd == -1) {
@@ -701,6 +703,10 @@ static int control_callback(int device) {
     break;
   case GADGETFS_SETUP:
   {
+#ifdef GADGET_DEBUG
+    fprintf(stderr, "SETUP %02x.%02x v%04x i%04x %d\n",
+        event.u.setup.bRequestType, event.u.setup.bRequest, event.u.setup.wValue, event.u.setup.wIndex, event.u.setup.wLength);
+#endif
     unsigned char buf[sizeof(event.u.setup) + event.u.setup.wLength];
     memcpy(buf, &event.u.setup, sizeof(event.u.setup));
     unsigned int count = sizeof(event.u.setup);
@@ -713,6 +719,10 @@ static int control_callback(int device) {
         }
         count += ret;
       }
+    }
+
+    if (devices[device].pending > 0) {
+      // cancel transfer?
     }
 
     devices[device].last_setup = event.u.setup;
@@ -902,10 +912,9 @@ int gadget_stall_control(int device, unsigned char direction) {
 
   GADGET_CHECK_DEVICE(device, -1)
 
-  int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
-  if (ret < 0) {
-    return -1;
-  }
+#ifdef GADGET_DEBUG
+  fprintf(stderr, "stall\n");
+#endif
 
   if (devices[device].pending > 0) {
     devices[device].pending--;
@@ -914,6 +923,11 @@ int gadget_stall_control(int device, unsigned char direction) {
   if (devices[device].pending != 0) {
     // TODO MLA: debug message
     return 0;
+  }
+
+  int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+  if (ret < 0) {
+    return -1;
   }
 
   int status;
@@ -946,10 +960,9 @@ int gadget_ack_control(int device, unsigned char direction) {
 
   GADGET_CHECK_DEVICE(device, -1)
 
-  int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
-  if (ret < 0) {
-    return -1;
-  }
+#ifdef GADGET_DEBUG
+  fprintf(stderr, "ack\n");
+#endif
 
   if (devices[device].pending > 0) {
     devices[device].pending--;
@@ -958,6 +971,11 @@ int gadget_ack_control(int device, unsigned char direction) {
   if (devices[device].pending != 0) {
     // TODO MLA: debug message
     return 0;
+  }
+
+  int ret = devices[device].fp_register(devices[device].fd, device, control_callback, control_callback, close_callback);
+  if (ret < 0) {
+    return -1;
   }
 
   if (devices[device].last_setup.bRequestType == (USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE)

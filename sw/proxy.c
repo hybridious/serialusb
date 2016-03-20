@@ -18,6 +18,7 @@
 #include <prio.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <stddef.h>
 
 #define ENDPOINT_MAX_NUMBER USB_ENDPOINT_NUMBER_MASK
 
@@ -199,7 +200,7 @@ int usb_read_callback(int user, unsigned char endpoint, const void * buf, int st
   return 0;
 }
 
-static int poll_all_endpoints() {
+static int source_poll_all_endpoints() {
 
   int ret = 0;
   unsigned char i;
@@ -212,7 +213,20 @@ static int poll_all_endpoints() {
   return ret;
 }
 
-int usb_write_callback(int user, unsigned char endpoint, int status) {
+static int target_poll_all_endpoints() {
+
+  int ret = 0;
+  unsigned char i;
+  for (i = 0; i < sizeof(*endpointMap.targetToSource) / sizeof(**endpointMap.targetToSource) && ret >= 0; ++i) {
+    uint8_t endpoint = ALLOCATOR_S2T_ENDPOINT(&endpointMap, USB_DIR_OUT | (i + 1));
+    if (endpoint) {
+      ret = gadget_poll(usb, endpoint);
+    }
+  }
+  return ret;
+}
+
+int source_write_callback(int user, unsigned char endpoint, int status) {
 
   switch (status) {
   case E_TRANSFER_TIMED_OUT:
@@ -253,7 +267,14 @@ int usb_write_callback(int user, unsigned char endpoint, int status) {
           return -1;
         }
         if (gadget_state == E_GADGET_CONFIGURING) {
-          poll_all_endpoints();
+          ret = source_poll_all_endpoints();
+          if (ret < 0) {
+            return -1;
+          }
+          ret = target_poll_all_endpoints();
+          if (ret < 0) {
+            return -1;
+          }
           gadget_state = E_GADGET_CONFIGURED;
         }
       }
@@ -264,7 +285,7 @@ int usb_write_callback(int user, unsigned char endpoint, int status) {
   return 0;
 }
 
-int usb_close_callback(int user) {
+int source_close_callback(int user) {
 
   done = 1;
   return 1;
@@ -286,7 +307,7 @@ int adapter_close_callback(int user) {
   return 1;
 }
 
-static char * usb_select() {
+static char * source_select() {
 
   char * path = NULL;
 
@@ -421,7 +442,8 @@ static int fix_configuration(unsigned char configurationIndex) {
               endpoint->bDescriptorType = 0x00;
               --bNumEndpoints;
             } else {
-              printf(KRED" -> %hu (stub)"KNRM, targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
+              printf(KRED" -> %hu (stub)"KNRM"\n", targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
+              endpoint->bEndpointAddress = targetEndpoint;
             }
             continue;
           } else {
@@ -431,7 +453,7 @@ static int fix_configuration(unsigned char configurationIndex) {
           printf(" -> %hu", targetEndpoint & USB_ENDPOINT_NUMBER_MASK);
         }
         printf("\n");
-        if (adapter >= 0) {
+        if (pEndpoints - endpoints < (ptrdiff_t)(sizeof(endpoints) / sizeof(*endpoints))) {
           pEndpoints->number = endpoint->bEndpointAddress;
           pEndpoints->type = endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
           pEndpoints->size = endpoint->wMaxPacketSize;
@@ -528,24 +550,24 @@ static int send_endpoints() {
   return adapter_send(adapter, E_TYPE_ENDPOINTS, (unsigned char *)&endpoints, (pEndpoints - endpoints) * sizeof(*endpoints));
 }
 
-static int usb_send_out_packet(unsigned char endpoint, const void * buf, unsigned int length) {
+static int source_send_out_transfer(unsigned char endpoint, const void * buf, unsigned int length) {
 
   endpoint = ALLOCATOR_T2S_ENDPOINT(&endpointMap, endpoint);
   if (endpoint == 0) {
-    PRINT_ERROR_OTHER("OUT packet directed to a stubbed endpoint")
+    PRINT_ERROR_OTHER("OUT transfer directed to a stubbed endpoint")
     return -1;
   }
 
   return gusb_write(usb, endpoint, buf, length);
 }
 
-static int usb_send_control_packet(struct usb_ctrlrequest * setup, unsigned int length) {
+static int source_send_control_transfer(struct usb_ctrlrequest * setup, unsigned int length) {
 
   if ((setup->bRequestType & USB_RECIP_MASK) == USB_RECIP_ENDPOINT) {
     if (setup->wIndex != 0) {
       setup->wIndex = ALLOCATOR_T2S_ENDPOINT(&endpointMap, setup->wIndex);
       if (setup->wIndex == 0) {
-        PRINT_ERROR_OTHER("control request directed to a stubbed endpoint")
+        PRINT_ERROR_OTHER("control transfer directed to a stubbed endpoint")
         return 0;
       }
     }
@@ -583,7 +605,7 @@ static int process_packet(int user, s_packet * packet)
     gtimer_close(init_timer);
     init_timer = -1;
     printf("Proxy started successfully. Press ctrl+c to stop it.\n");
-    ret = poll_all_endpoints();
+    ret = source_poll_all_endpoints();
     break;
   case E_TYPE_IN:
     if (inPending > 0) {
@@ -597,13 +619,13 @@ static int process_packet(int user, s_packet * packet)
   case E_TYPE_OUT:
     {
       s_endpointPacket * epPacket = (s_endpointPacket *)packet->value;
-      ret = usb_send_out_packet(epPacket->endpoint, epPacket->data, packet->header.length - 1);
+      ret = source_send_out_transfer(epPacket->endpoint, epPacket->data, packet->header.length - 1);
     }
     break;
   case E_TYPE_CONTROL:
     {
       struct usb_ctrlrequest * setup = (struct usb_ctrlrequest *)packet->value;
-      ret = usb_send_control_packet(setup, packet->header.length);
+      ret = source_send_control_transfer(setup, packet->header.length);
     }
     break;
   case E_TYPE_DEBUG:
@@ -634,9 +656,9 @@ static int process_packet(int user, s_packet * packet)
   return ret;
 }
 
-int proxy_init(char * port) {
+int proxy_init() {
 
-  char * path = usb_select();
+  char * path = source_select();
 
   if(path == NULL) {
     fprintf(stderr, "No USB device selected!\n");
@@ -709,7 +731,16 @@ static void get_descriptor(struct usb_ctrlrequest * setup, void ** data, uint16_
   }
 }
 
-static int gadget_read_callback(int user, unsigned char endpoint, const void * buf, int status) {
+static int target_read_callback(int user, unsigned char endpoint, const void * buf, int status) {
+
+  switch (status) {
+  //TODO MLA
+  case E_TRANSFER_ERROR:
+    PRINT_TRANSFER_WRITE_ERROR(endpoint, "OTHER ERROR")
+    return -1;
+  default:
+    break;
+  }
 
   if (endpoint == 0) {
 
@@ -717,9 +748,6 @@ static int gadget_read_callback(int user, unsigned char endpoint, const void * b
 
     void * data = NULL;
     uint16_t length = 0;
-
-    fprintf(stderr, "SETUP %02x.%02x v%04x i%04x %d\n",
-        setup->bRequestType, setup->bRequest, setup->wValue, setup->wIndex, setup->wLength);
 
     if (setup->bRequestType == (USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE)
             && setup->bRequest == USB_REQ_GET_DESCRIPTOR) {
@@ -734,15 +762,20 @@ static int gadget_read_callback(int user, unsigned char endpoint, const void * b
       gadget_state = E_GADGET_CONFIGURING;
     }
 
-    return usb_send_control_packet(setup, status);
+    return source_send_control_transfer(setup, status);
     
   } else {
 
-    return usb_send_out_packet(endpoint, buf, status);
+    int ret = gadget_poll(gadget, endpoint);
+    if (ret < 0) {
+      return -1;
+    }
+
+    return source_send_out_transfer(endpoint, buf, status);
   }
 }
 
-static int gadget_write_callback(int user, unsigned char endpoint, int status) {
+static int target_write_callback(int user, unsigned char endpoint, int status) {
 
   if (endpoint == 0) {
     PRINT_ERROR_OTHER("endpoint is 0")
@@ -761,7 +794,7 @@ static int gadget_write_callback(int user, unsigned char endpoint, int status) {
   return 0;
 }
 
-static int gadget_close_callback(int user) {
+static int target_close_callback(int user) {
 
   done = 1;
   return 1;
@@ -868,14 +901,14 @@ int proxy_start(const char * port, const char * hcd) {
           return -1;
       }
 
-      ret = gadget_register(gadget, 0, gadget_read_callback, gadget_write_callback, gadget_close_callback, gpoll_register_fd);
+      ret = gadget_register(gadget, 0, target_read_callback, target_write_callback, target_close_callback, gpoll_register_fd);
       if (ret < 0) {
           gadget_close(gadget);
           return -1;
       }
   }
 
-  ret = gusb_register(usb, 0, usb_read_callback, usb_write_callback, usb_close_callback, gpoll_register_fd);
+  ret = gusb_register(usb, 0, usb_read_callback, source_write_callback, source_close_callback, gpoll_register_fd);
   if (ret < 0) {
     return -1;
   }
