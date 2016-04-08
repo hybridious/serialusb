@@ -63,7 +63,7 @@ static enum {
   E_GADGET_INIT,
   E_GADGET_CONFIGURING,
   E_GADGET_CONFIGURED
-} gadget_state = E_GADGET_INIT;;
+} gadget_state = E_GADGET_INIT;
 
 static volatile int done;
 
