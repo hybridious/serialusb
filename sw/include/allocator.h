@@ -6,7 +6,7 @@
 #ifndef ALLOCATOR_H_
 #define ALLOCATOR_H_
 
-#include <gusb.h>
+#include <gimxusb/include/gusb.h>
 
 #define ALLOCATOR_MAX_ENDPOINT_NUMBER USB_ENDPOINT_NUMBER_MASK
 

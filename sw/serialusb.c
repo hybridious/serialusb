@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <info.h>
 #include <getopt.h>
+#include <gimxusb/include/gusb.h>
 
 static const char * port = NULL;
 static const char * hcd = NULL;
@@ -95,11 +96,17 @@ int main(int argc, char * argv[]) {
     return -1;
   }
 
+  if (gusb_init() < 0) {
+    return -1;
+  }
+
   ret = proxy_init();
 
   if (ret == 0 && (port != NULL || hcd != NULL)) {
     ret = proxy_start(port, hcd);
   }
+
+  gusb_exit();
 
   return ret;
 }

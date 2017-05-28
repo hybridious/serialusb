@@ -4,8 +4,8 @@
  */
 
 #include <adapter.h>
-#include <gserial.h>
-#include <gpoll.h>
+#include <gimxserial/include/gserial.h>
+#include <gimxpoll/include/gpoll.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -133,7 +133,14 @@ int adapter_open(const char * port, ADAPTER_READ_CALLBACK fp_read, ADAPTER_WRITE
     if (adapters[i].serial < 0) {
       adapters[i].serial = serial;
       adapters[i].fp_packet_cb = fp_read;
-      int ret = gserial_register(serial, i, adapter_recv, fp_write, fp_close, gpoll_register_fd);
+      GSERIAL_CALLBACKS serial_callbacks = {
+          .fp_read = adapter_recv,
+          .fp_write = fp_write,
+          .fp_close = fp_close,
+          .fp_register = gpoll_register_fd,
+          .fp_remove = gpoll_remove_fd
+      };
+      int ret = gserial_register(serial, i, &serial_callbacks);
       if (ret < 0) {
         return -1;
       }

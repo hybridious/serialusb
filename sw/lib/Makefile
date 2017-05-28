@@ -1,4 +1,4 @@
-DIRS = event async
+DIRS = gimxpoll gimxserial gimxprio gimxtimer gimxusb gimxgadget
 
 BUILDDIRS = $(DIRS:%=build-%)
 INSTALLDIRS = $(DIRS:%=install-%)

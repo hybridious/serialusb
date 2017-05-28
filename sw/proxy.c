@@ -3,19 +3,19 @@
  License: GPLv3
  */
 
-#include <gusb.h>
-#include <gadget.h>
-#include <gserial.h>
+#include <gimxusb/include/gusb.h>
+#include <gimxgadget/include/gadget.h>
+#include <gimxserial/include/gserial.h>
 #include <protocol.h>
 #include <adapter.h>
 #include <allocator.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <gpoll.h>
-#include <gtimer.h>
+#include <gimxpoll/include/gpoll.h>
+#include <gimxtimer/include/gtimer.h>
 #include <names.h>
-#include <prio.h>
+#include <gimxprio/include/gprio.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <stddef.h>
@@ -35,8 +35,7 @@ static int adapter = -1;
 static int gadget = -1;
 static int init_timer = -1;
 
-static s_usb_descriptors * descriptors = NULL;
-static uint8_t savedNumConfigurations = 0;
+static s_usb_descriptors descriptors;
 static unsigned char desc[MAX_DESCRIPTORS_SIZE] = {};
 static unsigned char * pDesc = desc;
 static s_descriptorIndex descIndex[MAX_DESCRIPTORS] = {};
@@ -311,7 +310,7 @@ static char * source_select() {
 
   char * path = NULL;
 
-  s_usb_dev * usb_devs = gusb_enumerate(0x0000, 0x0000);
+  struct gusb_device * usb_devs = gusb_enumerate(0x0000, 0x0000);
   if (usb_devs == NULL) {
     fprintf(stderr, "No USB device detected!\n");
     return NULL;
@@ -319,23 +318,23 @@ static char * source_select() {
   printf("Available USB devices:\n");
   unsigned int index = 0;
   char vendor[128], product[128];
-  s_usb_dev * current;
-  for (current = usb_devs; current != NULL; ++current) {
+  struct gusb_device * current;
+  for (current = usb_devs; current != NULL; current = current->next) {
     get_vendor_string(vendor, sizeof(vendor), current->vendor_id);
     get_product_string(product, sizeof(product), current->vendor_id, current->product_id);
     printf("%2d", index++);
     printf(" VID 0x%04x (%s)", current->vendor_id, strlen(vendor) ? vendor : "unknown vendor");
     printf(" PID 0x%04x (%s)", current->product_id, strlen(product) ? product : "unknown product");
     printf(" PATH %s\n", current->path);
-    if (current->next == 0) {
-      break;
-    }
   }
 
   printf("Select the USB device number: ");
   unsigned int choice = UINT_MAX;
   if (scanf("%d", &choice) == 1 && choice < index) {
-    path = strdup(usb_devs[choice].path);
+    for (current = usb_devs; current != NULL && choice != 0; current = current->next) {
+        --choice;
+    }
+    path = strdup(current->path);
     if(path == NULL) {
       fprintf(stderr, "can't duplicate path.\n");
     }
@@ -350,7 +349,7 @@ static char * source_select() {
 
 static void get_endpoint_properties(unsigned char configurationIndex, s_ep_props * props) {
 
-  struct p_configuration * pConfiguration = descriptors->configurations + configurationIndex;
+  struct p_configuration * pConfiguration = descriptors.configurations + configurationIndex;
   unsigned char interfaceIndex;
   for (interfaceIndex = 0; interfaceIndex < pConfiguration->descriptor->bNumInterfaces; ++interfaceIndex) {
     struct p_interface * pInterface = pConfiguration->interfaces + interfaceIndex;
@@ -389,15 +388,14 @@ static void get_endpoint_properties(unsigned char configurationIndex, s_ep_props
 
 static void fix_device() {
 
-  if (descriptors->configurations[0].descriptor->bmAttributes & USB_CONFIG_ATT_WAKEUP) {
+  if (descriptors.configurations[0].descriptor->bmAttributes & USB_CONFIG_ATT_WAKEUP) {
     printf("Disabled unsupported remote wakeup.\n");
-    descriptors->configurations[0].descriptor->bmAttributes &= ~USB_CONFIG_ATT_WAKEUP;
+    descriptors.configurations[0].descriptor->bmAttributes &= ~USB_CONFIG_ATT_WAKEUP;
   }
 
-  savedNumConfigurations = descriptors->device.bNumConfigurations;
-  if (descriptors->device.bNumConfigurations > 1) {
+  if (descriptors.device.bNumConfigurations > 1) {
     printf("Multiple configurations are not supported. Only the first one will be kept.\n");
-    descriptors->device.bNumConfigurations = 1;
+    descriptors.device.bNumConfigurations = 1;
   }
 }
 
@@ -405,12 +403,12 @@ static int fix_configuration(unsigned char configurationIndex) {
 
   pEndpoints = endpoints;
 
-  if (configurationIndex >= descriptors->device.bNumConfigurations) {
+  if (configurationIndex >= descriptors.device.bNumConfigurations) {
     PRINT_ERROR_OTHER("invalid configuration index")
     return -1;
   }
 
-  struct p_configuration * pConfiguration = descriptors->configurations + configurationIndex;
+  struct p_configuration * pConfiguration = descriptors.configurations + configurationIndex;
   printf("configuration: %hhu\n", pConfiguration->descriptor->bConfigurationValue);
   unsigned char interfaceIndex;
   for (interfaceIndex = 0; interfaceIndex < pConfiguration->descriptor->bNumInterfaces; ++interfaceIndex) {
@@ -423,7 +421,7 @@ static int fix_configuration(unsigned char configurationIndex) {
       unsigned char endpointIndex;
       for (endpointIndex = 0; endpointIndex < pAltInterface->bNumEndpoints; ++endpointIndex) {
         struct usb_endpoint_descriptor * endpoint =
-            descriptors->configurations[configurationIndex].interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
+            descriptors.configurations[configurationIndex].interfaces[interfaceIndex].altInterfaces[altInterfaceIndex].endpoints[endpointIndex];
         uint8_t sourceEndpoint = endpoint->bEndpointAddress;
         unsigned char targetEndpoint = ALLOCATOR_S2T_ENDPOINT(&endpointMap, sourceEndpoint);
         endpoint->bEndpointAddress = targetEndpoint;
@@ -493,28 +491,28 @@ int send_descriptors() {
 
   int ret;
 
-  ret = add_descriptor((USB_DT_DEVICE << 8), 0, sizeof(descriptors->device), &descriptors->device);
+  ret = add_descriptor((USB_DT_DEVICE << 8), 0, sizeof(descriptors.device), &descriptors.device);
   if (ret < 0) {
     return -1;
   }
 
-  ret = add_descriptor((USB_DT_STRING << 8), 0, sizeof(descriptors->langId0), &descriptors->langId0);
+  ret = add_descriptor((USB_DT_STRING << 8), 0, sizeof(descriptors.langId0), &descriptors.langId0);
   if (ret < 0) {
     return -1;
   }
 
   unsigned int descNumber;
-  for(descNumber = 0; descNumber < descriptors->device.bNumConfigurations; ++descNumber) {
+  for(descNumber = 0; descNumber < descriptors.device.bNumConfigurations; ++descNumber) {
 
-    ret = add_descriptor((USB_DT_CONFIG << 8) | descNumber, 0, descriptors->configurations[descNumber].descriptor->wTotalLength, descriptors->configurations[descNumber].raw);
+    ret = add_descriptor((USB_DT_CONFIG << 8) | descNumber, 0, descriptors.configurations[descNumber].descriptor->wTotalLength, descriptors.configurations[descNumber].raw);
     if (ret < 0) {
       return -1;
     }
   }
 
-  for(descNumber = 0; descNumber < descriptors->nbOthers; ++descNumber) {
+  for(descNumber = 0; descNumber < descriptors.nbOthers; ++descNumber) {
 
-    ret = add_descriptor(descriptors->others[descNumber].wValue, descriptors->others[descNumber].wIndex, descriptors->others[descNumber].wLength, descriptors->others[descNumber].data);
+    ret = add_descriptor(descriptors.others[descNumber].wValue, descriptors.others[descNumber].wIndex, descriptors.others[descNumber].wLength, descriptors.others[descNumber].data);
     if (ret < 0) {
       return -1;
     }
@@ -672,30 +670,32 @@ int proxy_init() {
     return -1;
   }
 
-  descriptors = gusb_get_usb_descriptors(usb);
-  if (descriptors == NULL) {
+  const s_usb_descriptors * desc = gusb_get_usb_descriptors(usb);
+  if (desc == NULL) {
     free(path);
     return -1;
   }
 
-  printf("Opened device: VID 0x%04x PID 0x%04x PATH %s\n", descriptors->device.idVendor, descriptors->device.idProduct, path);
+  printf("Opened device: VID 0x%04x PID 0x%04x PATH %s\n", desc->device.idVendor, desc->device.idProduct, path);
 
   free(path);
 
-  if (descriptors->device.bNumConfigurations == 0) {
+  if (desc->device.bNumConfigurations == 0) {
     PRINT_ERROR_OTHER("missing configuration")
     return -1;
   }
 
-  if (descriptors->configurations[0].descriptor->bNumInterfaces == 0) {
+  if (desc->configurations[0].descriptor->bNumInterfaces == 0) {
     PRINT_ERROR_OTHER("missing interface")
     return -1;
   }
 
-  if (descriptors->configurations[0].interfaces[0].bNumAltInterfaces == 0) {
+  if (desc->configurations[0].interfaces[0].bNumAltInterfaces == 0) {
     PRINT_ERROR_OTHER("missing altInterface")
     return -1;
   }
+
+  descriptors = *desc;
 
   return 0;
 }
@@ -716,15 +716,15 @@ static int timer_read(int user) {
 static void get_descriptor(struct usb_ctrlrequest * setup, void ** data, uint16_t * length) {
 
   if ((setup->wValue >> 8) ==  USB_DT_STRING && (setup->wValue & 0xff) == 0x00 && setup->wIndex == 0x0000) {
-    *data = &descriptors->langId0;
-    *length = descriptors->langId0.bLength;
+    *data = &descriptors.langId0;
+    *length = descriptors.langId0.bLength;
     return;
   } else {
     unsigned int descNumber;
-    for(descNumber = 0; descNumber < descriptors->nbOthers; ++descNumber) {
-      if (descriptors->others[descNumber].wValue == setup->wValue && setup->wIndex == descriptors->others[descNumber].wIndex) {
-        *data = descriptors->others[descNumber].data;
-        *length = descriptors->others[descNumber].wLength;
+    for(descNumber = 0; descNumber < descriptors.nbOthers; ++descNumber) {
+      if (descriptors.others[descNumber].wValue == setup->wValue && setup->wIndex == descriptors.others[descNumber].wIndex) {
+        *data = descriptors.others[descNumber].data;
+        *length = descriptors.others[descNumber].wLength;
         return;
       }
     }
@@ -815,7 +815,7 @@ void get_used_endpoints(unsigned short endpoints[2]) {
 
 int proxy_start(const char * port, const char * hcd) {
 
-  int ret = set_prio();
+  int ret = gprio();
   if (ret < 0)
   {
     PRINT_ERROR_OTHER("Failed to set process priority!")
@@ -850,7 +850,13 @@ int proxy_start(const char * port, const char * hcd) {
         return -1;
       }
 
-      init_timer = gtimer_start(0, 1000000, timer_close, timer_close, gpoll_register_fd);
+      GTIMER_CALLBACKS timer_callbacks = {
+          .fp_read = timer_close,
+          .fp_close = timer_close,
+          .fp_register = gpoll_register_fd,
+          .fp_remove = gpoll_remove_fd
+      };
+      init_timer = gtimer_start(0, 1000000, &timer_callbacks);
       if (init_timer < 0) {
         return -1;
       }
@@ -895,25 +901,45 @@ int proxy_start(const char * port, const char * hcd) {
       unsigned short endpoints[2] = {};
       get_used_endpoints(endpoints);
 
-      ret = gadget_configure(gadget, descriptors, endpoints);
+      ret = gadget_configure(gadget, &descriptors, endpoints);
       if (ret < 0) {
           gadget_close(gadget);
           return -1;
       }
 
-      ret = gadget_register(gadget, 0, target_read_callback, target_write_callback, target_close_callback, gpoll_register_fd);
+      GGADGET_CALLBACKS gadget_callbacks = {
+          .fp_read = target_read_callback,
+          .fp_write = target_write_callback,
+          .fp_close = target_close_callback,
+          .fp_register = gpoll_register_fd,
+          .fp_remove = gpoll_remove_fd
+      };
+      ret = gadget_register(gadget, 0, &gadget_callbacks);
       if (ret < 0) {
           gadget_close(gadget);
           return -1;
       }
   }
 
-  ret = gusb_register(usb, 0, usb_read_callback, source_write_callback, source_close_callback, gpoll_register_fd);
+  GUSB_CALLBACKS usb_callbacks = {
+      .fp_read = usb_read_callback,
+      .fp_write = source_write_callback,
+      .fp_close = source_close_callback,
+      .fp_register = gpoll_register_fd,
+      .fp_remove = gpoll_remove_fd
+  };
+  ret = gusb_register(usb, 0, &usb_callbacks);
   if (ret < 0) {
     return -1;
   }
 
-  int timer = gtimer_start(0, 10000, timer_read, timer_close, gpoll_register_fd);
+  GTIMER_CALLBACKS timer_callbacks = {
+      .fp_read = timer_read,
+      .fp_close = timer_close,
+      .fp_register = gpoll_register_fd,
+      .fp_remove = gpoll_remove_fd
+  };
+  int timer = gtimer_start(0, 10000, &timer_callbacks);
   if (timer < 0) {
     return -1;
   }
@@ -934,7 +960,6 @@ int proxy_start(const char * port, const char * hcd) {
       gadget_close(gadget);
   }
 
-  descriptors->device.bNumConfigurations = savedNumConfigurations; // make sure all memory is freed
   gusb_close(usb);
 
   if (init_timer >= 0) {
